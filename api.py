@@ -1,131 +1,134 @@
 import os, time, re, json
 import numpy as np
 from numpy.linalg import norm
-from openai import OpenAI
 from supabase import create_client, Client
-from fastapi import FastAPI, Query
+from openai import OpenAI
+from fastapi import FastAPI
 
-# ========== Lidhje API ==========
+# ========== FASTAPI ==========
+app_api = FastAPI()
+app = app_api   # mos e prek, ruaj identik
+
+# ========== SUPABASE CONNECT ==========
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-openai_key = os.getenv("OPENAI_API_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY or not openai_key:
-    raise SystemExit("❌ KE HARUAR Environment Variables në Render!")
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-client = OpenAI(api_key=openai_key)
 
-app = FastAPI()
+# ========== OPENAI CONNECT ==========
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_KEY)
 
-# ========== CACHING NË RAM (Cloud-friendly, por jo lokal!) ==========
-refine_cache = {}
-embedding_cache = {}
+# ========== PARAMETRA ==========
+GREEN_TH  = 0.70
+YELLOW_TH = 0.60
+RED_TH    = 0.50
 
-# ========== Utils ==========
+# ========== FUNKSIONE ==========
 def cosine(a, b):
     na, nb = norm(a), norm(b)
-    if na==0 or nb==0: return 0.0
-    return float(np.dot(a, b)/(na*nb))
+    return 0.0 if na == 0 or nb == 0 else float(np.dot(a, b) / (na * nb))
 
-def scale01(x): return max(0.0, min(1.0,(x+1.0)/2.0))
+def scale01(x):
+    return max(0.0, min(1.0, (x + 1.0) / 2.0))
 
-def to_arr(x):
-    if x is None: return None
-    if isinstance(x, list):
-        arr = np.array(x, dtype=np.float32).flatten()
-        return arr if arr.size else None
-    if isinstance(x, str):
-        try:
-            arr = np.array(json.loads(x), dtype=np.float32).flatten()
-            return arr if arr.size else None
-        except:
-            nums = [float(n) for n in re.split(r"[,\s]+", x.strip("[] ")) if n]
-            arr = np.array(nums, dtype=np.float32).flatten()
-            return arr if arr.size else None
-    return None
-
-# ========== Refine inteligjent super i shkurtër ==========
-def refine_query(q: str):
-    key = q.lower().strip()
-    if key in refine_cache:
-        return refine_cache[key]
-
-    prompt = f"""
-Kthe vetëm JSON:
-{{"cleaned":"{q}","refined":"{q}"}}
-
-Mos ndrysho asgjë në kuptim, vetëm pastro nëse duhet dhe mbaje dyfjalësh 'veprim objekt, kategori' kur ka veprim.
-Për profesion pa veprim: "hidraulik banjo, ndërtim"
-Për probleme: "riparim bojleri, hidraulik"
-Për kurse: "kurs matematike, arsim"
-Kërkesa: "{q}"
-"""
+def gpt_check(service_name, query):
+    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për "{query}"? Kthe vetëm: po/jo'
     try:
-        rsp = client.chat.completions.create(
-            model=ONECALL_MODEL,
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[{"role":"user","content":prompt}],
             temperature=0.0,
-            max_tokens=35
+            max_tokens=3
         )
-        data = json.loads(rsp.choices[0].message.content.strip())
-        cleaned = data["cleaned"]
-        refined = data["refined"]
+        return r.choices[0].message.content.strip().lower() == "po"
     except:
-        cleaned, refined = q, q
+        return False
 
-    refine_cache[key] = (cleaned, refined)
-    return cleaned, refined
+# ========== ENDPOINTS ==========
+@app_api.get("/health")
+def health():
+    return {"status": "ok", "time_sec": 0.0}
 
-# ========== Embedding Cloud Supabase ==========
-def embed_query(text: str):
-    key = text.lower().strip()
-    if key in embedding_cache:
-        return embedding_cache[key]
+@app_api.get("/columns")
+def list_columns():
+    sample = supabase.from_("detailedtable").select("*").limit(1).execute().data
+    if not sample:
+        return []
+    return list(sample[0].keys())
 
-    try:
-        rsp = client.embeddings.create(model=EMBED_QUERY_MODEL, input=text)
-        arr = np.array(rsp.data[0].embedding, dtype=np.float32).flatten()
-        embedding_cache[key] = arr
-        return arr
-    except:
-        return None
-
-# ========== Smart search me pragje ========== 
-@app.get("/search")
-def search_service(q: str = Query(...)):
+@app_api.get("/search")
+def search_service(q: str):
     t0 = time.time()
 
-    # 1) CLEAN & REFINE
-    cleaned, refined = refine_query(q)
+    # 1) clean input
+    cleaned = re.sub(r"[^a-zA-Z0-9 ëç]+", "", q.lower()).strip()
+    
+    # 2) refine = saktësisht cleaned
+    refined = cleaned  # identik me logjikën tënde
 
-    # 2) EMBEDDING QUERY
-    q_emb = embed_query(refined)
-    if q_emb is None:
-        return {"results":[],"time_sec":round(time.time()-t0,2)}
+    # 3) embed query me large
+    try:
+        rsp = client.embeddings.create(model="text-embedding-3-large", input=refined)
+        qemb = np.array(rsp.data[0].embedding, dtype=np.float32)
+    except:
+        return {"results": [], "time_sec": round(time.time() - t0, 2)}
 
-    # 3) SEARCH SIMILARITY ndaj Supabase table
-    rows = supabase.from_("detailedtable").select("id,name,category,embedding_large,keywords").execute().data
+    # 4) load service rows nga supabase me ID të përbashkët
+    try:
+        rows = supabase.from_("detailedtable").select("id,name,embedding_large,keywords,uniqueid,category").execute().data
+    except:
+        return {"results": [], "time_sec": round(time.time() - t0, 2)}
+
     scored = []
-
     for r in rows:
-        emb = to_arr(r.get("embedding_large"))
-        if emb is None: continue
-        sim = cosine(q_emb, emb)
-        sim01 = scale01(sim)
+        e = r.get("embedding_large")
+        emb = None
 
-        # elimino poshte 0.6
-        if sim01 < 0.6: continue
-        # ruaj relevante
-        scored.append((sim01, sim, r))
+        if isinstance(e, list):
+            emb = np.array(e, dtype=np.float32)
+        elif isinstance(e, str):
+            try:
+                arr = json.loads(e)
+                if isinstance(arr, list) and len(arr) > 1:
+                    emb = np.array(arr, dtype=np.float32)
+            except:
+                continue
+
+        if emb is None:
+            continue
+
+        sim_raw = cosine(qemb, emb)
+        sim01 = scale01(sim_raw)
+
+        if sim01 < RED_TH:
+            continue
+
+        scored.append((sim01, sim_raw, r))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
     final = []
-    # 4) GREEN zona ≥0.7
-    for sim01, sim, r in scored[:4]:
-        color = "🟢" if sim01>=0.7 else "🟡"
-        final.append({"id":r["id"],"name":r["name"],"profession":r["category"],"score":sim01,"zone":color})
+    for sim01, sim_raw, r in scored[:4]:
+        final.append({
+            "id": r["id"],
+            "name": r["name"],
+            "score": round(sim01, 3),
+            "uniqueid": r.get("uniqueid") or r.get("uniqueid", "")
+        })
 
-    t_total = time.time()-t0
-    return {"results":final,"time_sec":round(t_total,2)}
+    # yellow chance me GPT-check vetëm nëse 1–2 green
+    greens = [x for x in scored if x[0] >= GREEN_TH]
+    yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
+
+    if 1 <= len(final) < 3 and yellows:
+        y = yellows[0]
+        if gpt_check(r["name"], refined):
+            final.append({
+                "id": y[2]["id"],
+                "name": y[2]["name"],
+                "score": round(y[0], 3),
+                "uniqueid": y[2].get("uniqueid", "")
+            })
+
+    t_total = time.time() - t0
+    return {"results": final, "time_sec": round(t_total, 2)}
