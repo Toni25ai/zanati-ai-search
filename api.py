@@ -1,39 +1,51 @@
-import os, time, re, json, requests
+import os, time, re, json
 import numpy as np
 from numpy.linalg import norm
-
-# ========== IMPORTS FIX ==========
-from supabase import create_client, Client  # nga supabase-py alternative
-from openai import OpenAI  # library e saktë përmes pip install openai
+from supabase import create_client, Client
+from openai import OpenAI
 from fastapi import FastAPI
 
-# ========== FASTAPI INIT ==========
 app = FastAPI()
 
-# ========== SUPABASE CONNECT ==========
+# ===== 1) Lidhjet (saktë si në projekt) =====
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ========== OPENAI CONNECT ==========
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_KEY)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ========== CACHE ========== 
+# ===== 2) Load JSON 1x në memory (RAM) =====
+# JSON file qëndron në root folder të projektit në Render
+# (Nuk përdorim R2 keys për search speed)
+SERVICES_JSON = "services_cache_v7_clean.json"
+
+if not os.path.exists(SERVICES_JSON):
+    raise Exception(f"❌ File {SERVICES_JSON} nuk ekziston në server! Duhet ta upload-osh te Render.")
+
+with open(SERVICES_JSON, "r", encoding="utf-8") as f:
+    RAW_SERVICES = json.load(f)
+
 SERVICES = []
-LOADED = False
+for s in RAW_SERVICES:
+    vec = s.get("embedding_clean")
+    if vec is None:
+        continue
+    SERVICES.append({
+        "id": s["id"],
+        "name": s["name"],
+        "category": s.get("category", ""),
+        "keywords": s.get("keywords", [])[:5],
+        "uniqueid": s.get("uniqueid",""),
+        "embedding": np.array(vec, dtype=np.float32)
+    })
 
-# ========== PARAMETRAT ==========
-GREEN_TH  = 0.70
-YELLOW_TH = 0.60
-RED_TH    = 0.50
+print(f"✅ U ngarkuan {len(SERVICES)} services në RAM.")
 
-# ========== FUNKSIONET ==========
+# ===== 3) Funksionet utility identike si lokale =====
 def cosine(a, b):
     na, nb = norm(a), norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a, b) / (na * nb))
+    return 0.0 if na == 0 or nb == 0 else float(np.dot(a, b) / (na * nb))
 
 def scale01(x):
     return max(0.0, min(1.0, (x + 1.0) / 2.0))
@@ -41,120 +53,43 @@ def scale01(x):
 def normalize(t: str):
     return re.sub(r"[^a-zA-Z0-9 ëç]+", "", t.lower()).strip()
 
-def gpt_check(service_name, query):
-    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për "{query}"? Kthe vetëm: po / jo.'
-    try:
-        r = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=3
-        )
-        return r.choices[0].message.content.strip().lower().startswith("po")
-    except:
-        return False
-
-def load_services_once():
-    global SERVICES, LOADED
-    if LOADED:
-        return
-
-    print("⬇️ Po shkarkoj JSON 1x…")
-    R2_ACCOUNT = "3a4c4d0d75c22ad3e96653008476f710"
-    url = f"https://{R2_ACCOUNT}.r2.cloudflarestorage.com/servicescache/services_cache_v7_clean.json"
-
-    try:
-        data = requests.get(url, timeout=20).json()
-    except Exception as e:
-        print("❌ JSON failed:", e)
-        SERVICES = []
-        LOADED = True
-        return
-
-    SERVICES.clear()
-    for s in data:
-        vec = s.get("embedding_clean")
-        if not vec:
-            continue
-        uid = s.get("uniqueid","")
-        SERVICES.append({
-            "id": s.get("id"),
-            "name": s.get("name"),
-            "category": s.get("category",""),
-            "keywords": s.get("keywords", []),
-            "uniqueid": uid,
-            "embedding": np.array(vec, dtype=np.float32)
-        })
-
-    LOADED = True
-    print(f"✅ Loaded {len(SERVICES)} into RAM")
-
-# Thirre 1x në start
-load_services_once()
-
-# ========== ENDPOINTS ==========
+# ===== 4) Endpoint Health =====
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-@app.get("/columns")
-def columns():
-    try:
-        s = supabase.table("detailedtable").select("*").limit(1).execute().data
-    except:
-        return []
-    if not s:
-        return []
-    return list(s[0].keys())
-
+# ===== 5) Endpoint Search (super i shpejt, identical RAM based) =====
 @app.get("/search")
-def search(q: str):
+def search_service(q: str):
     t0 = time.time()
-    q = normalize(q)
+    query_text = normalize(q)
 
-    # krijo embedding
+    # Krijo embedding për query
     try:
-        rsp = client.embeddings.create(model="text-embedding-3-large", input=q)
-        qv = np.array(rsp.data[0].embedding, dtype=np.float32)
-    except:
+        rsp = client.embeddings.create(model="text-embedding-3-large", input=query_text)
+        qvec = np.array(rsp.data[0].embedding, dtype=np.float32)
+    except Exception as e:
+        print("❌ Embedding failed:", e)
         return {"results": [], "time_sec": round(time.time()-t0,2)}
 
-    # similarity identical si në PC
+    # Llogarit similarity me services në RAM (identical)
     scored = []
     for s in SERVICES:
-        sim_raw = cosine(qv, s["embedding"])
+        sim_raw = cosine(qvec, s["embedding"])
         sim01 = scale01(sim_raw)
-        if sim01 < RED_TH:
-            continue
         scored.append((sim01, sim_raw, s))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    final = []
-    for sim01, sim_raw, s in scored[:4]:
-        final.append({
+    # Kthe 4 rezultatet e para identical
+    results = []
+    for sim01, _, s in scored[:4]:
+        results.append({
             "id": s["id"],
             "name": s["name"],
-            "category": s.get("category",""),
-            "keywords": s.get("keywords",[])[:5],
+            "category": s["category"],
             "uniqueid": s["uniqueid"],
             "score": round(sim01, 3)
         })
 
-    # GPT check vetëm për yellow identical si logjika jote
-    greens  = [x for x in scored if x[0] >= GREEN_TH]
-    yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
-
-    if greens and 1 <= len(final) < 3 and yellows:
-        cand = yellows[0][2]
-        if gpt_check(cand["name"], q):
-            final.append({
-                "id": cand["id"],
-                "name": cand["name"],
-                "category": cand.get("category",""),
-                "keywords": cand.get("keywords",[])[:5],
-                "uniqueid": cand["uniqueid"],
-                "score": round(yellows[0][0],3)
-            })
-
-    return {"results": final, "time_sec": round(time.time()-t0,2)}
+    return {"results": results, "time_sec": round(time.time() - t0, 2)}
