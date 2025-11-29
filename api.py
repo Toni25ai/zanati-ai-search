@@ -3,7 +3,7 @@ import numpy as np
 from numpy.linalg import norm
 
 # ========== IMPORTS FIX ==========
-from supabase_py import create_client, Client  # nga supabase-py alternative
+from supabase import create_client, Client  # nga supabase-py alternative
 from openai import OpenAI  # library e saktë përmes pip install openai
 from fastapi import FastAPI
 
