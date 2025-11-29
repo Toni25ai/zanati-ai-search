@@ -1,6 +1,6 @@
+requests
+numpy
+boto3
+openai
 fastapi
 uvicorn
-openai
-supabase
-python-dotenv
-numpy
