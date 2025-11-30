@@ -1,12 +1,11 @@
-import os, time, re, json, requests
+import os, time, re, json, boto3
 import numpy as np
 from numpy.linalg import norm
-from openai import OpenAI
-from supabase import create_client, Client
 from fastapi import FastAPI
-import boto3
+from supabase import create_client, Client
+from openai import OpenAI
 
-# ========== FASTAPI APP ==========
+# ========== APP ==========
 app = FastAPI()
 
 # ========== SUPABASE CONNECT ==========
@@ -18,26 +17,36 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY)
 
-# ========== PARAMETRA ==========
-GREEN_TH  = 0.70
+# ========== PRAGJET (IDENTIKE ME PC) ==========
+GREEN_TH = 0.70
 YELLOW_TH = 0.60
-RED_TH    = 0.50
+RED_TH = 0.60  # 👈 FIKS si versione lokale
 
-# ========== FUNKSIONE ==========
+# ========== CACHING NE SERVER CLOUD (Render RAM) ==========
+refine_cache = {}
+embed_cache = {}
+
+# ========== FUNKSIONET (IDENTIKE) ==========
+
 def cosine(a, b):
     na, nb = norm(a), norm(b)
-    return 0.0 if na == 0 or nb == 0 else float(np.dot(a, b) / (na * nb))
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
 
 def scale01(x):
     return max(0.0, min(1.0, (x + 1.0) / 2.0))
 
 def safe_list(v):
-    if isinstance(v, list): return v
-    if v is None: return []
+    if isinstance(v, list):
+        return v
+    if v is None:
+        return []
     return [v]
 
 def to_arr(x):
-    if x is None: return None
+    if x is None:
+        return None
     if isinstance(x, list):
         arr = np.array(x, dtype=np.float32)
         return arr if arr.size else None
@@ -51,95 +60,120 @@ def to_arr(x):
             return arr if arr.size else None
     return None
 
-# ==========  LOAD JSON 1x NGA R2 + MBAJE NE RAM  ==========
+# ========== REFINE QUERY DETERMINISTIK ==========
+def refine_query(user_input: str):
+    key = user_input.strip().lower()
+    if key in refine_cache:
+        return refine_cache[key]
+
+    cleaned = re.sub(r"[^a-zA-Z0-9 ëç]+", "", user_input.lower()).strip()
+    refined = cleaned
+
+    refine_cache[key] = (cleaned, refined)
+    return cleaned, refined
+
+# ========== EMBED QUERY ME CACHE NE CLOUD ==========
+def embed_query(text: str):
+    key = text.lower()
+    if key in embed_cache:
+        return embed_cache[key]
+
+    for _ in range(3):
+        try:
+            r = client.embeddings.create(model="text-embedding-3-large", input=text)
+            arr = np.array(r.data[0].embedding, dtype=np.float32)
+            embed_cache[key] = arr
+            return arr
+        except:
+            time.sleep(0.3)
+    return None
+
+# ========== GPT CHECK DETERMINISTIK 👇 FIX I RËNDËSISHËM ==========
+def gpt_check(query, service_name):
+    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po / jo.'
+    try:
+        rsp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.0,
+            max_tokens=3,
+            seed=1234  # 👈 AI s’tolerohet nga restart i Render, por outputi LLM stabil
+        )
+        ans = rsp.choices[0].message.content.strip().lower()
+        return ans.startswith("p")
+    except:
+        return False
+
+# ========== LOAD SERVICES 1x NGA R2 NE RAM CLOUD ==========
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_SECRET = os.getenv("R2_SECRET_ACCESS_KEY")
 
 s3 = boto3.client(
     "s3",
     aws_access_key_id=R2_ACCESS_KEY_ID,
-    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-    endpoint_url="https://3a4c4d0d75c22ad3e96653008476f710.r2.cloudflarestorage.com"
+    aws_secret_access_key=R2_SECRET,
+    endpoint_url=os.getenv("R2_ENDPOINT_URL")
 )
 
-print("⬇️ Loading JSON 1x from bucket into RAM...")
+print("⬇️ Loading services from Cloudflare R2 into Render RAM...")
 try:
-    obj = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
+    obj = s3.get_object(Bucket="servicescache", Key="detailed.json")
     raw = obj["Body"].read().decode("utf-8")
     SERVICES = json.loads(raw)
-    print(f"✅ Loaded {len(SERVICES)} services into RAM")
+    print(f"✅ Loaded {len(SERVICES)} services from Cloudflare into Render RAM")
 except Exception as e:
-    print("❌ JSON failed to load:", str(e))
+    print("❌ Failed to load services from R2:", str(e))
     SERVICES = []
 
-# ========== ENDPOINTS ==========
-@app.get("/health")
-def health():
-    return {"status": "ok", "time_sec": 0.0}
-
-@app.get("/columns")
-def list_columns():
-    sample = supabase.from_("detailedtable").select("*").limit(1).execute().data
-    if not sample:
-        return []
-    return list(sample[0].keys())
-
+# ========== SEARCH ENDPOINT (FIKS SI PC LOCAL) ==========
 @app.get("/search")
-def search_service(q: str):
+def search_service(q: str = ""):
     t0 = time.time()
 
-    # 1) clean input
-    cleaned = re.sub(r"[^a-zA-Z0-9 ëç]+", "", q.lower()).strip()
-    
-    # 2) refine = identik
-    refined = cleaned
+    cleaned, refined = refine_query(q)
+    qemb = embed_query(refined)
 
-    # 3) embed query
-    try:
-        r = client.embeddings.create(model="text-embedding-3-large", input=refined)
-        qemb = np.array(r.data[0].embedding, dtype=np.float32)
-    except:
+    if qemb is None:
         return {"results": [], "time_sec": round(time.time() - t0, 2)}
 
-    # 4) krahaso me 661 services në RAM (identike si në lokal)
     scored = []
     for s in SERVICES:
-        e = s.get("embedding_large") or s.get("embedding_clean")
-        emb = to_arr(e)
+        emb = to_arr(s.get("embedding_large"))
         if emb is None:
             continue
 
         sim_raw = cosine(qemb, emb)
         sim01 = scale01(sim_raw)
-
-        if sim01 < RED_TH:
+        if sim01 < 0.60:
             continue
-
         scored.append((sim01, sim_raw, s))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
     final = []
-    for sim01, sim_raw, s in scored[:4]:
-        final.append({
-            "id": s["id"],
-            "name": s["name"],
-            "score": round(sim01, 3),
-            "uniqueid": s.get("uniqueid", "")
-        })
-
-    # GPT check fiks si versioni yt
-    greens  = [x for x in scored if x[0] >= GREEN_TH]
+    greens = [x for x in scored if x[0] >= GREEN_TH]
     yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
 
-    if 1 <= len(final) < 3 and yellows:
-        third = yellows[0]
-        if gpt_check(third[2]["name"], refined):
-            final.append({
-                "id": third[2]["id"],
-                "name": third[2]["name"],
-                "score": round(third[0], 3),
-                "uniqueid": third[2].get("uniqueid", "")
-            })
+    if greens:
+        for sim01, sim_raw, s in greens[:4]:
+            final.append(s)
+        if 1 <= len(final) < 3 and yellows:
+            third = yellows[0]
+            if gpt_check(refined, third[2]["name"]):
+                final.append(third[2])
+    else:
+        chosen = yellows[:2]
+        if len(yellows) >= 3:
+            c = yellows[2]
+            if gpt_check(refined, c[2]["name"]):
+                chosen.append(c)
+        for score, sim, s in chosen:
+            final.append(s)
 
-    return {"results": final, "time_sec": round(time.time() - t0, 2)}
+    final = [x for x in final if x[0] >= 0.60]
+
+    results_json = []
+    for sim01, sim_raw, s in scored[:4]:
+        results_json.append({"id": s["id"], "name": s["name"], "score": round(sim01,3), "uniqueid": s.get("uniqueid","")})
+
+    return {"query": q, "cleaned": cleaned, "refined": refined, "results": results_json, "time_sec": round(time.time() - t0, 2)}
