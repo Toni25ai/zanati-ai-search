@@ -1,4 +1,4 @@
-import os, time, re, json
+import os, time, re, json, requests
 import numpy as np
 from numpy.linalg import norm
 from supabase import create_client, Client
@@ -7,7 +7,7 @@ from fastapi import FastAPI
 
 app = FastAPI()
 
-# ===== 1) Lidhjet (saktë si në projekt) =====
+# ===== 1) Lidhjet =====
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -15,37 +15,20 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ===== 2) Load JSON 1x në memory (RAM) =====
-# JSON file qëndron në root folder të projektit në Render
-# (Nuk përdorim R2 keys për search speed)
-SERVICES_JSON = "services_cache_v7_clean.json"
-
-if not os.path.exists(SERVICES_JSON):
-    raise Exception(f"❌ File {SERVICES_JSON} nuk ekziston në server! Duhet ta upload-osh te Render.")
-
-with open(SERVICES_JSON, "r", encoding="utf-8") as f:
-    RAW_SERVICES = json.load(f)
+# ===== 2) Parametrat (identik si lokal, s’i ndryshojmë) =====
+GREEN_TH  = 0.70
+YELLOW_TH = 0.60
+RED_TH    = 0.50
 
 SERVICES = []
-for s in RAW_SERVICES:
-    vec = s.get("embedding_clean")
-    if vec is None:
-        continue
-    SERVICES.append({
-        "id": s["id"],
-        "name": s["name"],
-        "category": s.get("category", ""),
-        "keywords": s.get("keywords", [])[:5],
-        "uniqueid": s.get("uniqueid",""),
-        "embedding": np.array(vec, dtype=np.float32)
-    })
+LOADED = False
 
-print(f"✅ U ngarkuan {len(SERVICES)} services në RAM.")
-
-# ===== 3) Funksionet utility identike si lokale =====
+# ===== 3) Funksionet =====
 def cosine(a, b):
     na, nb = norm(a), norm(b)
-    return 0.0 if na == 0 or nb == 0 else float(np.dot(a, b) / (na * nb))
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
 
 def scale01(x):
     return max(0.0, min(1.0, (x + 1.0) / 2.0))
@@ -53,43 +36,92 @@ def scale01(x):
 def normalize(t: str):
     return re.sub(r"[^a-zA-Z0-9 ëç]+", "", t.lower()).strip()
 
-# ===== 4) Endpoint Health =====
+def gpt_check(service_name, query):
+    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për "{query}"? Kthe vetëm: po/jo'
+    try:
+        rsp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.0,
+            max_tokens=3
+        )
+        ans = rsp.choices[0].message.content.strip().lower()
+        return ans.startswith("p")
+    except:
+        return False
+
+# ===== 4) Ngarko JSON 1× nga R2 në start dhe mbaje në RAM =====
+R2_ACCOUNT = "3a4c4d0d75c22ad3e96653008476f710"
+JSON_URL = f"https://{R2_ACCOUNT}.r2.cloudflarestorage.com/servicescache/services_cache_v7_clean.json"
+
+def load_services_once():
+    global SERVICES, LOADED
+    if LOADED:
+        return
+    print("⬇️ Po shkarkoj JSON 1x në memory…")
+    try:
+        resp = requests.get(JSON_URL, timeout=20)
+        data = resp.json()
+    except Exception as e:
+        print("❌ JSON load dështoi:", e)
+        SERVICES = []
+        LOADED = True
+        return
+
+    SERVICES.clear()
+    for s in data:
+        vec = s.get("embedding_clean")
+        if vec is None: continue
+        uid = s.get("uniqueid","")
+        SERVICES.append({
+            "id": s["id"],
+            "name": s["name"],
+            "category": s.get("category",""),
+            "keywords": s.get("keywords",[])[:5],
+            "uniqueid": uid,
+            "embedding": np.array(vec, dtype=np.float32)
+        })
+    LOADED = True
+    print(f"✅ Loaded {len(SERVICES)} services in RAM.")
+
+# thirre direkt në start
+load_services_once()
+
+# ===== 5) Endpoints =====
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# ===== 5) Endpoint Search (super i shpejt, identical RAM based) =====
 @app.get("/search")
 def search_service(q: str):
     t0 = time.time()
     query_text = normalize(q)
 
-    # Krijo embedding për query
+    # embed query
     try:
-        rsp = client.embeddings.create(model="text-embedding-3-large", input=query_text)
-        qvec = np.array(rsp.data[0].embedding, dtype=np.float32)
-    except Exception as e:
-        print("❌ Embedding failed:", e)
+        e = client.embeddings.create(model="text-embedding-3-large", input=query_text)
+        qv = np.array(e.data[0].embedding, dtype=np.float32)
+    except:
         return {"results": [], "time_sec": round(time.time()-t0,2)}
 
-    # Llogarit similarity me services në RAM (identical)
     scored = []
     for s in SERVICES:
-        sim_raw = cosine(qvec, s["embedding"])
+        sim_raw = cosine(qv, s["embedding"])
         sim01 = scale01(sim_raw)
+        if sim01 < RED_TH:
+            continue
         scored.append((sim01, sim_raw, s))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # Kthe 4 rezultatet e para identical
-    results = []
+    final = []
     for sim01, _, s in scored[:4]:
-        results.append({
+        final.append({
             "id": s["id"],
             "name": s["name"],
-            "category": s["category"],
+            "category": s.get("category",""),
             "uniqueid": s["uniqueid"],
             "score": round(sim01, 3)
         })
 
-    return {"results": results, "time_sec": round(time.time() - t0, 2)}
+    return {"results": final, "time_sec": round(time.time()-t0,2)}
