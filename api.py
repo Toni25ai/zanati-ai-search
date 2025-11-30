@@ -1,33 +1,32 @@
-import os, time, re, json
-import boto3
+import os, time, re, json, boto3
 import numpy as np
 from numpy.linalg import norm
 from fastapi import FastAPI, Query
 from supabase import create_client, Client
 from openai import OpenAI
 
-# ========== APP ==========
+# ========== FASTAPI APP ==========
 app = FastAPI()
 
-# ========== Supabase ==========
+# ========== SUPABASE CONNECT ==========
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ========== OpenAI ==========
+# ========== OPENAI CONNECT ==========
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY)
 
-# ========== Thresholds fixed (si në local) ==========
+# ========== PRAGJET (identike me lokal) ==========
 GREEN_TH = 0.70
 YELLOW_TH = 0.60
-RED_TH = 0.60
+RED_TH = 0.60  # cutoff strict
 
-# ========== Cache server-side (te cloud, jo PC) ==========
+# ========== CACHE NË SERVER (Render cloud RAM) ==========
 refine_cache = {}
 embed_cache = {}
 
-# ========== Utils ==========
+# ========== FUNKSIONE ==========
 def cosine(a, b):
     na, nb = norm(a), norm(b)
     if na == 0 or nb == 0:
@@ -60,40 +59,12 @@ def to_arr(x):
             return arr if arr.size else None
     return None
 
-# ========== Refine (identik, deterministic, cached në cloud server) ==========
-def refine_query(user_input: str):
-    key = user_input.strip().lower()
-    if key in refine_cache:
-        return refine_cache[key]
-
-    cleaned = re.sub(r"[^a-zA-Z0-9 ëç]+", "", user_input.lower()).strip()
-    refined = cleaned
-    refine_cache[key] = (cleaned, refined)
-    return cleaned, refined
-
-# ========== Embeddings deterministic (cache server-side) ==========
-def embed_query(text: str):
-    key = text.lower()
-    if key in embed_cache:
-        return embed_cache[key]
-
-    for _ in range(3):
-        try:
-            r = client.embeddings.create(model="text-embedding-3-large", input=text)
-            arr = np.array(r.data[0].embedding, dtype=np.float32)
-            embed_cache[key] = arr
-            return arr
-        except:
-            time.sleep(0.2)
-    return None
-
-# ========== GPT Check stable, deterministic me seed fixed ==========
-def gpt_check(query, service_name):
+def gpt_check(service_name, query):
     prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po / jo.'
     try:
         rsp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=3,
             seed=1234
@@ -103,7 +74,9 @@ def gpt_check(query, service_name):
     except:
         return False
 
-# ========== Load services 1x nga Cloudflare R2 → qëndron vetëm në cloud RAM, siç ti do ==========
+# ========== LOAD SERVICES 1x NGA CLOUDFLARE R2 ==========
+print("⬇️ Po ngarkoj shërbimet nga R2 në server RAM të Render...\n")
+
 R2_BUCKET_URL = os.getenv("R2_BUCKET_URL")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET = os.getenv("R2_SECRET_ACCESS_KEY")
@@ -116,86 +89,37 @@ s3 = boto3.client(
     region_name="auto"
 )
 
-print("⬇️ Po ngarkoj shërbimet nga R2 në cloud RAM...")
 try:
-    obj = s3.get_object(Bucket="servicescache", Key="servicescache/services_cache_v7_clean.json")
+    obj = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
     raw = obj["Body"].read().decode("utf-8")
-    SERVICES = json.loads(raw)
-    print(f"✅ U ngarkuan {len(SERVICES)} shërbime në RAM nga R2")
+    ALL_SERVICES = json.loads(raw)
+    print(f"✅ U ngarkuan {len(ALL_SERVICES)} shërbime nga R2 në RAM\n")
 except Exception as e:
-    print("❌ Dështoi load:", str(e))
-    SERVICES = []
+    print("❌ Dështoi ngarkimi nga R2:", str(e))
+    ALL_SERVICES = []
 
-# ========== Endpoint /search stable ==========
-@app.get("/search")
-def search_service(q: str = Query("", alias="q")):
-    t0 = time.time()
+# I kthejmë në format uniform si në lokal
+SERVICES = []
+for s in ALL_SERVICES:
+    emb = to_arr(s.get("embedding_clean")) or to_arr(s.get("embedding_large"))
+    if emb is None:
+        continue
+    SERVICES.append({
+        "id": s.get("id"),
+        "name": s.get("name"),
+        "category": s.get("category"),
+        "keywords": [k.lower() for k in safe_list(s.get("keywords", []))],
+        "embedding": emb,
+        "uniqueid": s.get("uniqueid","")
+    })
 
-    # 1) pastrojmë + refine 1x
-    cleaned, refined = refine_query(q)
+print(f"🚀 Në backend u indeksuan {len(SERVICES)} embedding vectors\n")
 
-    # 2) embedding nga cache server-side
-    qemb = embed_query(refined)
-    if qemb is None:
-        return {"results": [], "time_sec": round(time.time() - t0, 2)}
+# ========== ENDPOINTS ==========
 
-    # 3) krahasojmë me datasetin `SERVICES` në cloud RAM
-    scored = []
-    for s in SERVICES:
-        vec = to_arr(s.get("embedding_clean") or s.get("embedding_large"))
-        if vec is None:
-            continue
-        sim_raw = cosine(qemb, vec)
-        sim01 = scale01(sim_raw)
-        if sim01 < RED_TH:
-            continue
-        scored.append((sim01, sim_raw, s))
-
-    # 4) sort deterministic
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    # 5) krijojmë listën finale pa random
-    final = []
-    greens = [x for x in scored if x[0] >= GREEN_TH]
-    yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
-
-    if greens:
-        # marrim 4 të parat nga greens
-        for sc01, sim, s in greens[:4]:
-            final.append(s)
-        # plotësojmë me yellows nëse duhen 3 rezultate
-        if 1 <= len(final) < 3 and yellows:
-            third = yellows[0][2]
-            if gpt_check(refined, third["name"]):
-                final.append(third)
-    elif yellows:
-        # marrim 2-3 yellows deterministic me GPT check
-        chosen = yellows[:2]
-        if len(yellows) >= 3:
-            cand = yellows[2][2]
-            if gpt_check(refined, cand["name"]):
-                chosen.append((yellows[2][0], yellows[2][1], yellows[2][2]))
-        for sc01, sim, s in chosen:
-            final.append(s)
-
-    # 6) Heqim çdo rezultat nën 0.60 (*identik me versionin lokal*)
-    final_scored = []
-    for sc01, sim, s in scored[:4]:
-        if sc01 >= 0.60:
-            final_scored.append((sc01, s))
-
-    final_json = []
-    for sc01, s in final_scored:
-        final_json.append({
-            "id": s.get("id"),
-            "name": s.get("name"),
-            "score": round(sc01, 3),
-            "uniqueid": s.get("uniqueid", ""),
-            "category": s.get("category"),
-            "keywords": s.get("keywords",[])
-        })
-
-    return {"query": q, "cleaned": cleaned, "refined": refined, "results": final_json, "time_sec": round(time.time() - t0, 2)}
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.get("/columns")
 def list_columns():
@@ -203,3 +127,88 @@ def list_columns():
     if not sample:
         return []
     return list(sample[0].keys())
+
+@app.get("/search")
+def search_service(q: str = Query("", alias="q")):
+    """
+    Endpoint 100% i qëndrueshëm:
+    clean -> refine query 1x -> embed me cache -> cosine -> threshold strict -> sort -> GPT check stable
+    """
+    t0 = time.time()
+
+    # 1) PASRTOJ query
+    cleaned, refined = refine_query(q)
+
+    # 2) MARRIM embedding cached cloud
+    key = refined.lower()
+    if key in embed_cache:
+        qemb = embed_cache[key]
+    else:
+        qemb = None
+        for _ in range(3):
+            try:
+                r = client.embeddings.create(model="text-embedding-3-large", input=refined)
+                qemb = np.array(r.data[0].embedding, dtype=np.float32)
+                embed_cache[key] = qemb
+                break
+            except:
+                time.sleep(0.2)
+
+    if qemb is None:
+        return {"results": [], "time_sec": round(time.time() - t0, 2)}
+
+    # 3) Krahaso me services
+    scored = []
+    for s in SERVICES:
+        sim_raw = cosine(qemb, s["embedding"])
+        sim01 = scale01(sim_raw)
+        if sim01 < RED_TH:
+            continue
+        scored.append((sim01, sim_raw, s))
+
+    # 4) Sort deterministic
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # 5) Marrim 4 më të mirat
+    top4 = scored[:4]
+
+    # 6) Filtrat GREEN/YELLOW + GPT check stable
+    greens = [x for x in scored if x[0] >= GREEN_TH]
+    yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
+
+    final = []
+    if greens:
+        for sc01, sc, s in greens[:4]:
+            final.append(s)
+        if 1 <= len(final) < 3 and yellows:
+            third = yellows[0]
+            if gpt_check(third[2]["name"], refined):
+                final.append(third[2])
+    else:
+        if yellows:
+            chosen = yellows[:2]
+            if len(yellows) >= 3:
+                cand = yellows[2]
+                if gpt_check(cand[2]["name"], refined):
+                    chosen.append(cand)
+            for sc01, sc, s in chosen:
+                final.append(s)
+
+    # 7) Build JSON për Bubble
+    results = []
+    for sim01, sim_raw, s in top4:
+        results.append({
+            "id": s["id"],
+            "name": s["name"],
+            "category": s["category"],
+            "score": round(sim01, 3),
+            "uniqueid": s["uniqueid"]
+        })
+
+    return {
+        "query": q,
+        "cleaned": cleaned,
+        "refined": refined,
+        "results": results,
+        "time_sec": round(time.time() - t0, 2)
+    }
