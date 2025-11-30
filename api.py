@@ -1,11 +1,12 @@
-import os, time, re, json, boto3
+import os, time, re, json
+import boto3
 import numpy as np
 from numpy.linalg import norm
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from supabase import create_client, Client
 from openai import OpenAI
 
-# ========== APP ==========
+# ========== FASTAPI APP ==========
 app = FastAPI()
 
 # ========== SUPABASE CONNECT ==========
@@ -17,16 +18,16 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY)
 
-# ========== PRAGJET (IDENTIKE ME PC) ==========
+# ========== PRAGJET (IDENTIKE ME LOKALIN) ==========
 GREEN_TH = 0.70
 YELLOW_TH = 0.60
-RED_TH = 0.60  # 👈 FIKS si versione lokale
+RED_TH = 0.60  # Eliminim fiks si në PC lokal
 
-# ========== CACHING NE SERVER CLOUD (Render RAM) ==========
+# ========== SERVER-SIDE CACHE NE CLOUD ==========
 refine_cache = {}
 embed_cache = {}
 
-# ========== FUNKSIONET (IDENTIKE) ==========
+# ========== FUNKSIONE UTILE ==========
 
 def cosine(a, b):
     na, nb = norm(a), norm(b)
@@ -60,24 +61,26 @@ def to_arr(x):
             return arr if arr.size else None
     return None
 
-# ========== REFINE QUERY DETERMINISTIK ==========
+# ========== REFINE QUERY (GPT layer removed – identical logic, no random) ==========
 def refine_query(user_input: str):
     key = user_input.strip().lower()
     if key in refine_cache:
         return refine_cache[key]
 
+    # Pastrojmë inputin fiks si në PC
     cleaned = re.sub(r"[^a-zA-Z0-9 ëç]+", "", user_input.lower()).strip()
-    refined = cleaned
+    refined = cleaned  # Nuk ndryshojmë logjikë, bëjmë identik
 
     refine_cache[key] = (cleaned, refined)
     return cleaned, refined
 
-# ========== EMBED QUERY ME CACHE NE CLOUD ==========
+# ========== EMBEDDING QUERY me CACHE (server-side cloud) ==========
 def embed_query(text: str):
     key = text.lower()
     if key in embed_cache:
         return embed_cache[key]
 
+    # Provojmë 3 herë embedding, por ruajmë në cache serveri
     for _ in range(3):
         try:
             r = client.embeddings.create(model="text-embedding-3-large", input=text)
@@ -85,11 +88,11 @@ def embed_query(text: str):
             embed_cache[key] = arr
             return arr
         except:
-            time.sleep(0.3)
+            time.sleep(0.2)
     return None
 
-# ========== GPT CHECK DETERMINISTIK 👇 FIX I RËNDËSISHËM ==========
-def gpt_check(query, service_name):
+# ========== GPT CHECK deterministik (përdorim argumentet me rend FIXED) ==========
+def gpt_check(service_name, query):
     prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po / jo.'
     try:
         rsp = client.chat.completions.create(
@@ -97,83 +100,109 @@ def gpt_check(query, service_name):
             messages=[{"role":"user","content":prompt}],
             temperature=0.0,
             max_tokens=3,
-            seed=1234  # 👈 AI s’tolerohet nga restart i Render, por outputi LLM stabil
+            seed=1234  # 👈 Fiksojmë seedin për stabilitet
         )
         ans = rsp.choices[0].message.content.strip().lower()
         return ans.startswith("p")
     except:
         return False
 
-# ========== LOAD SERVICES 1x NGA R2 NE RAM CLOUD ==========
+# ========== LOAD SERVICES 1x NGA CLOUDFARE R2 INTO RENDER CLOUD RAM ==========
+print("⬇️ Po ngarkoj shërbimet nga R2 në RAM të serverit cloud...")
+
+R2_BUCKET_URL = os.getenv("R2_BUCKET_URL")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
-R2_SECRET = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
 
 s3 = boto3.client(
     "s3",
     aws_access_key_id=R2_ACCESS_KEY_ID,
-    aws_secret_access_key=R2_SECRET,
-    endpoint_url=os.getenv("R2_ENDPOINT_URL")
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+    endpoint_url=R2_BUCKET_URL,
+    region_name="auto"
 )
 
-print("⬇️ Loading services from Cloudflare R2 into Render RAM...")
 try:
-    obj = s3.get_object(Bucket="servicescache", Key="detailed.json")
+    obj = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
     raw = obj["Body"].read().decode("utf-8")
     SERVICES = json.loads(raw)
-    print(f"✅ Loaded {len(SERVICES)} services from Cloudflare into Render RAM")
+    print(f"✅ U ngarkuan {len(SERVICES)} services nga R2 në cloud RAM")
 except Exception as e:
-    print("❌ Failed to load services from R2:", str(e))
+    print("❌ Dështoi load nga R2:", str(e))
     SERVICES = []
 
-# ========== SEARCH ENDPOINT (FIKS SI PC LOCAL) ==========
+# ========== ENDPOINTS ==========
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/columns")
+def list_columns():
+    sample = supabase.from_("detailedtable").select("*").limit(1).execute().data
+    if not sample:
+        return []
+    return list(sample[0].keys())
+
 @app.get("/search")
-def search_service(q: str = ""):
+def search_service(
+    q: str = Query("", alias="q")
+):
+    """
+    Search i stabilizuar: refine → embed me cache → cosine → filter >0.60 → sort → GPT check
+    """
     t0 = time.time()
 
+    # 1) Pastrojmë dhe refine query 1x cloud only
     cleaned, refined = refine_query(q)
-    qemb = embed_query(refined)
 
+    # 2) Marrim embedding me cache server-side në cloud
+    qemb = embed_query(refined)
     if qemb is None:
         return {"results": [], "time_sec": round(time.time() - t0, 2)}
 
+    # 3) Cosine similarity + filtering identik
     scored = []
     for s in SERVICES:
         emb = to_arr(s.get("embedding_large"))
         if emb is None:
             continue
-
         sim_raw = cosine(qemb, emb)
         sim01 = scale01(sim_raw)
-        if sim01 < 0.60:
+        if sim01 < RED_TH:
             continue
         scored.append((sim01, sim_raw, s))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
+    # 4) Seleksionojmë 4 më të mirat
     final = []
+    for sim01, sim_raw, s in scored[:4]:
+        final.append({
+            "id": s.get("id"),
+            "name": s.get("name"),
+            "score": round(sim01, 3),
+            "uniqueid": s.get("uniqueid", ""),
+            "category": s.get("category"),
+            "keywords": s.get("keywords", [])
+        })
+
+    # 5) Pragjet Green/Yellow + GPT check deterministic
     greens = [x for x in scored if x[0] >= GREEN_TH]
     yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
 
     if greens:
-        for sim01, sim_raw, s in greens[:4]:
-            final.append(s)
-        if 1 <= len(final) < 3 and yellows:
+        # Nëse ka green, i përdorim
+        if len(final) < 3 and yellows:
             third = yellows[0]
-            if gpt_check(refined, third[2]["name"]):
-                final.append(third[2])
-    else:
-        chosen = yellows[:2]
-        if len(yellows) >= 3:
-            c = yellows[2]
-            if gpt_check(refined, c[2]["name"]):
-                chosen.append(c)
-        for score, sim, s in chosen:
-            final.append(s)
+            if gpt_check(third[2]["name"], refined):
+                final.append({
+                    "id": third[2]["id"],
+                    "name": third[2]["name"],
+                    "score": round(third[0], 3),
+                    "uniqueid": third[2].get("uniqueid", ""),
+                    "category": third[2].get("category"),
+                    "keywords": third[2].get("keywords", [])
+                })
 
-    final = [x for x in final if x[0] >= 0.60]
-
-    results_json = []
-    for sim01, sim_raw, s in scored[:4]:
-        results_json.append({"id": s["id"], "name": s["name"], "score": round(sim01,3), "uniqueid": s.get("uniqueid","")})
-
-    return {"query": q, "cleaned": cleaned, "refined": refined, "results": results_json, "time_sec": round(time.time() - t0, 2)}
+    return {"query": q, "cleaned": cleaned, "refined": refined, "results": final, "time_sec": round(time.time() - t0, 2)}
