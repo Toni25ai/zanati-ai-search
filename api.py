@@ -10,7 +10,7 @@ app = FastAPI()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # 2) URL e file që ke ruajtur në R2 bucket (keq-citiruar më herët)
-SERVICES_JSON_URL = "https://3a4c4d0d75c22ad3e96653008476f710.r2.cloudflarestorage.com/servicescache/services_cache_v7_clean.json"
+SERVICES_JSON_URL = "https://3a4c4d0d75c22ad3e96653008476f710.r2.cloudflarestorage.com/servicescache/services_cache_v7_clean.json" 
 
 # 3) Load file 1x në memory (RAM)
 SERVICES = requests.get(SERVICES_JSON_URL, timeout=20).json()
