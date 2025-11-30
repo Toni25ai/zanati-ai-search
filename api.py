@@ -1,6 +1,7 @@
 import os, time, re, json, requests
 import numpy as np
 from numpy.linalg import norm
+import requests
 from supabase import create_client, Client
 from openai import OpenAI
 from fastapi import FastAPI
