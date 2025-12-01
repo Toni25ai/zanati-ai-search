@@ -20,9 +20,8 @@ client = OpenAI(api_key=OPENAI_KEY)
 # ========== PARAMETRA ==========
 GREEN_TH = 0.70
 YELLOW_TH = 0.60
-RED_TH = 0.60
 
-# ========== CACHES (cloud RAM) ==========
+# ========== CLOUD CACHES ==========
 refine_cache = {}
 embed_cache = {}
 
@@ -35,6 +34,9 @@ def cosine(a, b):
 
 def scale01(x):
     return max(0.0, min(1.0, (x + 1.0)/2.0))
+
+def safe_list(v):
+    return v if isinstance(v,list) else [] if v is None else [v]
 
 def to_arr(x):
     if x is None:
@@ -52,158 +54,148 @@ def to_arr(x):
             return arr if arr.size else None
     return None
 
-def safe_list(v):
-    return v if isinstance(v,list) else [] if v is None else [v]
-
 def gpt_check(service_name, query):
     prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Vetëm po/jo.'
     try:
-        r = client.chat.completions.create(
+        rsp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"user","content":prompt}],
             temperature=0.0,
             max_tokens=3,
             seed=1234
         )
-        ans = r.choices[0].message.content.strip().lower()
+        ans = rsp.choices[0].message.content.strip().lower()
         return ans.startswith("p")
     except:
         return False
 
-# ========== LOAD SERVICES 1x NGA CLOUDFARE R2 ==========
-R2_BUCKET_URL = os.getenv("R2_BUCKET_URL")
+# ==== Load services 至 Render RAM (identik si lokal, nga R2) ====
+R2_ENDPOINT = os.getenv("R2_BUCKET_URL")
 R2_AK = os.getenv("R2_ACCESS_KEY_ID")
 R2_SK = os.getenv("R2_SECRET_ACCESS_KEY")
 
+# Cloudflare R2 S3 client
 s3 = boto3.client("s3",
     aws_access_key_id=R2_AK,
     aws_secret_access_key=R2_SK,
-    endpoint_url=R2_BUCKET_URL,
+    endpoint_url=R2_ENDPOINT,
     region_name="auto"
 )
 
-print("⬇️ Loading services from R2 → Render RAM…")
+print("⬇️ Loading services from R2 → Render RAM...")
 try:
-    o = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
-    raw = o["Body"].read().decode("utf-8")
-    ALL = json.loads(raw)
-    print("✅ Loaded:", len(ALL))
+    obj = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
+    raw_body = obj["Body"].read().decode("utf-8")
+    services_cloud = json.loads(raw_body)
+    print("✅ Loaded:", len(services_cloud))
 except Exception as e:
-    print("❌ Load error:", e)
-    ALL = []
+    print("❌ Failed to load:", e)
+    services_cloud = []
 
-SERVICES=[]
-for s in ALL:
-    e1 = to_arr(s.get("embedding_clean"))
-    e2 = to_arr(s.get("embedding_large"))
+# Populate RAM list identike si lokal
+RAM_SERVICES = []
+for s in services_cloud:
+    emb_watch1 = to_arr(s.get("embedding_clean"))
+    emb_watch2 = to_arr(s.get("embedding_large"))
 
-    if isinstance(e1, np.ndarray):
-        emb = e1
-    elif isinstance(e2, np.ndarray):
-        emb = e2
+    if isinstance(emb_watch1, np.ndarray):
+        vector = emb_watch1
+    elif isinstance(emb_watch2, np.ndarray):
+        vector = emb_watch2
     else:
         continue
 
-    SERVICES.append({
+    RAM_SERVICES.append({
         "id": s.get("id"),
         "name": s.get("name"),
         "category": s.get("category"),
-        "keywords":[k.lower() for k in safe_list(s.get("keywords",[]))],
-        "embedding": emb,
+        "keywords":[k for k in safe_list(s.get("keywords",[]))],
+        "embedding": vector,
         "uniqueid": s.get("uniqueid","")
     })
 
-print(f"🚀 Indexed {len(SERVICES)} embeddings në cloud")
+print(f"🚀 Services in RAM:", len(RAM_SERVICES))
 
-# ========== ENDPOINT /search — Bubble dynamic compatible ==========
-
+# ========== ENDPOINT /search (POST) ==========
 @app.post("/search")
 async def search_service(body: dict):
-    t0 = time.time()
 
-    # Merr query-n nga JSON body
-    q = body.get("q", "")
+    user_query = body.get("q","")
 
-    # 1) Clean + refine deterministic cached key
-    key = q.strip().lower()
+    # 1) REFINE QUERY CACHED (fiks si lokal)
+    key = user_query.strip().lower()
     if key in refine_cache:
         cleaned, refined = refine_cache[key]
     else:
-        cleaned = re.sub(r"[^a-zA-Z0-9 ëç]+", "", q.lower()).strip()
+        # IDENTIKE SI LOKAL (pa regex fallback)
+        cleaned = user_query.strip()
         refined = cleaned
         refine_cache[key] = (cleaned, refined)
 
-    # 2) Embedding cached cloud
+    # 2) EMBEDDING CACHED (fiks si lokal)
     ekey = refined.lower()
     if ekey in embed_cache:
         qemb = embed_cache[ekey]
     else:
-        qemb=None
         for _ in range(3):
             try:
                 r = client.embeddings.create(model="text-embedding-3-large", input=refined)
-                qemb=np.array(r.data[0].embedding,dtype=np.float32)
-                embed_cache[ekey]=qemb
+                vector = np.array(r.data[0].embedding, dtype=np.float32)
+                embed_cache[ekey] = vector
+                qemb = vector
                 break
             except:
                 time.sleep(0.2)
 
-    if qemb is None:
+    if 'qemb' not in locals():
         return {"results":[],"time_sec":round(time.time()-t0,2)}
 
-    # 3) Similarity + filter strict
-    scored=[]
-    for s in SERVICES:
-        vec = s["embedding"]
-        sim_raw=cosine(qemb,vec)
-        sim01=scale01(sim_raw)
-        if sim01<RED_TH: continue
-        scored.append((sim01,sim_raw,s))
-    scored.sort(key=lambda x:x[0],reverse=True)
+    # 3) SIMILARITY (fiks si lokal)
+    scored = []
+    for s in RAM_SERVICES:
+        sim_raw = cosine(qemb, s["embedding"])
+        sim01 = scale01(sim_raw)
+        scored.append((sim01, sim_raw, s))
 
-    # 4) top 4
-    top4=scored[:4]
+    scored.sort(key=lambda x: x[0], reverse=True)
 
-    # 5) Green/Yellow logic deterministic + GPT check stable
-    greens=[x for x in scored if x[0]>=GREEN_TH]
-    yellows=[x for x in scored if YELLOW_TH<=x[0]<GREEN_TH]
-    final=[]
+    # 4) GREEN / YELLOW + GPT CHECK (identik si lokal)
+    greens = [x for x in scored if x[0] >= GREEN_TH]
+    yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
+    final = []
 
     if greens:
-        for sc01, sc, s in greens[:4]:
-            final.append((sc01, sc, s))
-        if 1<=len(final)<3 and yellows:
-            third=yellows[0][2]
-            if gpt_check(third["name"],refined):
-                final.append((yellows[0][0], yellows[0][1], third))
+        for g in greens[:4]:
+            final.append(g)
+        if 1 <= len(final) < 3 and yellows:
+            third = yellows[0]
+            if gpt_check(third[2]["name"], refined):
+                final.append(third)
     else:
-        if yellows:
-            chosen=yellows[:2]
-            if len(yellows)>=3:
-                cand=yellows[2][2]
-                if gpt_check(cand["name"],refined):
-                    chosen.append(cand)
-            for sc01, sc, s in chosen:
-                final.append((sc01,sc,s))
+        chosen = yellows[:2]
+        if len(yellows) >= 3:
+            cand = yellows[2]
+            if gpt_check(cand[2]["name"], refined):
+                chosen.append(cand)
+        final = chosen
 
-    final=[x for x in final if x[0]>=YELLOW_TH]
+    final = [x for x in final if x[0] >= 0.60]
 
-    # 6) Build JSON
+    # 5) BUILD RESULT JSON
     results=[]
-    for sc01, sc, s in top4:
-        if sc01<YELLOW_TH: continue
+    for sim01,cos,s in final:
         results.append({
             "id": s["id"],
             "name": s["name"],
-            "category": s.get("category",""),
-            "score": round(sc01,3),
+            "category": s["category"],
+            "score": round(sim01,3),
             "uniqueid": s["uniqueid"],
             "keywords": s.get("keywords",[])
         })
 
     return {
-        "results": results,
-        "time_sec": round(time.time() - t0, 2),
+        "results": results[:TOP_N] if len(results)>=3 else results[:3],
+        "time_sec": round(time.time()-t0,2),
         "cleaned": cleaned,
         "refined": refined
     }
