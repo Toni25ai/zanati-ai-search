@@ -1,28 +1,28 @@
 import os, time, re, json, boto3
 import numpy as np
 from numpy.linalg import norm
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from supabase import create_client, Client
 from openai import OpenAI
 
-# ========== FASTAPI APP ==========
+# ========== APP ==========
 app = FastAPI()
 
-# ========== SUPABASE CONNECT ==========
+# ========== Supabase ==========
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ========== OPENAI CONNECT ==========
+# ========== OpenAI ==========
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY)
 
-# ========== PRAGJET (identike me lokal) ==========
+# ========== PARAMETRA ==========
 GREEN_TH = 0.70
 YELLOW_TH = 0.60
-RED_TH = 0.60  # cutoff fiks si lokal
+RED_TH = 0.60
 
-# ========== CACHE NË CLOUD RAM ==========
+# ========== CACHES (cloud RAM) ==========
 refine_cache = {}
 embed_cache = {}
 
@@ -31,17 +31,10 @@ def cosine(a, b):
     na, nb = norm(a), norm(b)
     if na == 0 or nb == 0:
         return 0.0
-    return float(np.dot(a, b)/(na*nb))
+    return float(np.dot(a, b) / (na * nb))
 
 def scale01(x):
     return max(0.0, min(1.0, (x + 1.0)/2.0))
-
-def safe_list(v):
-    if isinstance(v, list):
-        return v
-    if v is None:
-        return []
-    return [v]
 
 def to_arr(x):
     if x is None:
@@ -54,138 +47,168 @@ def to_arr(x):
             arr = np.array(json.loads(x), dtype=np.float32)
             return arr if arr.size else None
         except:
-            nums=[float(n) for n in re.split(r"[,\s]+", x.strip("[] ")) if n]
-            arr=np.array(nums, dtype=np.float32)
+            nums = [float(n) for n in re.split(r"[,\s]+", x.strip("[] ")) if n]
+            arr = np.array(nums, dtype=np.float32)
             return arr if arr.size else None
     return None
 
+def safe_list(v):
+    return v if isinstance(v,list) else [] if v is None else [v]
+
 def gpt_check(service_name, query):
-    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po/jo.'
+    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Vetëm po/jo.'
     try:
-        rsp = client.chat.completions.create(
+        r = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"user","content":prompt}],
             temperature=0.0,
             max_tokens=3,
-            seed=1234  # 👈 seed fixed deterministic
+            seed=1234
         )
-        ans = rsp.choices[0].message.content.strip().lower()
+        ans = r.choices[0].message.content.strip().lower()
         return ans.startswith("p")
     except:
         return False
 
-# ========== LOAD SERVICES 1x NGA R2 ==========
-print("⬇️ Po ngarkoj shërbimet nga R2 në cloud RAM të Render...\n")
-
+# ========== LOAD SERVICES 1x NGA CLOUDFARE R2 ==========
 R2_BUCKET_URL = os.getenv("R2_BUCKET_URL")
-R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
-R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_AK = os.getenv("R2_ACCESS_KEY_ID")
+R2_SK = os.getenv("R2_SECRET_ACCESS_KEY")
 
-s3 = boto3.client(
-    "s3",
-    aws_access_key_id=R2_ACCESS_KEY_ID,
-    aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+s3 = boto3.client("s3",
+    aws_access_key_id=R2_AK,
+    aws_secret_access_key=R2_SK,
     endpoint_url=R2_BUCKET_URL,
     region_name="auto"
 )
 
+print("⬇️ Loading services from R2 → Render RAM…")
 try:
-    obj = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
-    raw = obj["Body"].read().decode("utf-8")
-    ALL_SERVICES = json.loads(raw)
-    print(f"✅ U ngarkuan {len(ALL_SERVICES)} shërbime nga R2 në RAM\n")
+    o = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
+    raw = o["Body"].read().decode("utf-8")
+    ALL = json.loads(raw)
+    print("✅ Loaded:", len(ALL))
 except Exception as e:
-    print("❌ Dështoi ngarkimi nga R2:", str(e))
-    ALL_SERVICES = []
+    print("❌ Load error:", e)
+    ALL = []
 
-# Konvertojmë service-in në strukturë uniforme pa `or`
-SERVICES = []
-for s in ALL_SERVICES:
+SERVICES=[]
+for s in ALL:
     e1 = to_arr(s.get("embedding_clean"))
     e2 = to_arr(s.get("embedding_large"))
 
-    # Zgjedhja e embedding në mënyrë të sigurt
     if isinstance(e1, np.ndarray):
         emb = e1
     elif isinstance(e2, np.ndarray):
         emb = e2
     else:
-        continue  # skip nëse asnjë embedding nuk është valid
+        continue
 
     SERVICES.append({
         "id": s.get("id"),
         "name": s.get("name"),
         "category": s.get("category"),
-        "keywords": [k.lower() for k in safe_list(s.get("keywords", []))],
+        "keywords":[k.lower() for k in safe_list(s.get("keywords",[]))],
         "embedding": emb,
         "uniqueid": s.get("uniqueid","")
     })
 
-print(f"🚀 Në backend u indeksuan {len(SERVICES)} embedding vectors\n")
+print(f"🚀 Indexed {len(SERVICES)} embeddings në cloud")
 
-# ========== ENDPOINT /search DETERMINISTIC ==========
-@app.get("/search")
-def search_service(q: str = Query("", alias="q")):
+# ========== ENDPOINT /search — Bubble dynamic compatible ==========
+
+@app.post("/search")
+async def search_service(body: dict):
     t0 = time.time()
 
-    # 1) CLEAN + REFINE 1x (cache server-i)
+    # Merr query-n nga JSON body
+    q = body.get("q", "")
+
+    # 1) Clean + refine deterministic cached key
     key = q.strip().lower()
     if key in refine_cache:
         cleaned, refined = refine_cache[key]
     else:
-        cleaned = re.sub(r"[^a-zA-Z0-9 ëç]+","",q.lower()).strip()
+        cleaned = re.sub(r"[^a-zA-Z0-9 ëç]+", "", q.lower()).strip()
         refined = cleaned
         refine_cache[key] = (cleaned, refined)
 
-    # 2) EMBEDDING me CACHE stable
+    # 2) Embedding cached cloud
     ekey = refined.lower()
     if ekey in embed_cache:
         qemb = embed_cache[ekey]
     else:
-        qemb = None
+        qemb=None
         for _ in range(3):
             try:
                 r = client.embeddings.create(model="text-embedding-3-large", input=refined)
-                qemb = np.array(r.data[0].embedding, dtype=np.float32)
-                embed_cache[ekey] = qemb
+                qemb=np.array(r.data[0].embedding,dtype=np.float32)
+                embed_cache[ekey]=qemb
                 break
             except:
                 time.sleep(0.2)
 
     if qemb is None:
-        return {"results": [], "time_sec": round(time.time()-t0,2)}
+        return {"results":[],"time_sec":round(time.time()-t0,2)}
 
-    # 3) SIMILARITY + FILTER strict
-    scored = []
+    # 3) Similarity + filter strict
+    scored=[]
     for s in SERVICES:
-        sim_raw = cosine(qemb, s["embedding"])
-        sim01 = scale01(sim_raw)
-        if sim01 < RED_TH:
-            continue
-        scored.append((sim01, sim_raw, s))
+        vec = s["embedding"]
+        sim_raw=cosine(qemb,vec)
+        sim01=scale01(sim_raw)
+        if sim01<RED_TH: continue
+        scored.append((sim01,sim_raw,s))
+    scored.sort(key=lambda x:x[0],reverse=True)
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    # 4) top 4
+    top4=scored[:4]
 
-    # 4) Marrim top 4 (identik çdo herë)
+    # 5) Green/Yellow logic deterministic + GPT check stable
+    greens=[x for x in scored if x[0]>=GREEN_TH]
+    yellows=[x for x in scored if YELLOW_TH<=x[0]<GREEN_TH]
+    final=[]
+
+    if greens:
+        for sc01, sc, s in greens[:4]:
+            final.append((sc01, sc, s))
+        if 1<=len(final)<3 and yellows:
+            third=yellows[0][2]
+            if gpt_check(third["name"],refined):
+                final.append((yellows[0][0], yellows[0][1], third))
+    else:
+        if yellows:
+            chosen=yellows[:2]
+            if len(yellows)>=3:
+                cand=yellows[2][2]
+                if gpt_check(cand["name"],refined):
+                    chosen.append(cand)
+            for sc01, sc, s in chosen:
+                final.append((sc01,sc,s))
+
+    final=[x for x in final if x[0]>=YELLOW_TH]
+
+    # 6) Build JSON
     results=[]
-    for sc01, sc, s in scored[:4]:
+    for sc01, sc, s in top4:
+        if sc01<YELLOW_TH: continue
         results.append({
             "id": s["id"],
             "name": s["name"],
-            "category": s["category"],
+            "category": s.get("category",""),
             "score": round(sc01,3),
-            "uniqueid": s.get("uniqueid",""),
+            "uniqueid": s["uniqueid"],
             "keywords": s.get("keywords",[])
         })
 
     return {
-        "query": q,
-        "cleaned": cleaned,
-        "refined": refined,
         "results": results,
-        "time_sec": round(time.time()-t0,2)
+        "time_sec": round(time.time() - t0, 2),
+        "cleaned": cleaned,
+        "refined": refined
     }
 
-@app.get("/health")
-def health():
-    return {"status":"ok"}
+@app.get("/columns")
+def list_columns():
+    s = supabase.table("detailedtable").select("*").limit(1).execute().data
+    return [] if not s else list(s[0].keys())
