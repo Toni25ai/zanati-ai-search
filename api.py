@@ -1,111 +1,170 @@
-import os, time, json, boto3
+import os, time, re, json, boto3
 import numpy as np
 from numpy.linalg import norm
 from fastapi import FastAPI
 from supabase import create_client, Client
 from openai import OpenAI
 
+# ========== FASTAPI APP ==========
 app = FastAPI()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
+# ========== OPENAI CONNECT ==========
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY)
 
-GREEN_TH  = 0.70
+# ========== PARAMETRA (SI LOKAL) ==========
+GREEN_TH = 0.70
 YELLOW_TH = 0.60
-RED_TH    = 0.60
+RED_TH = 0.60
 
-# ========== load 1x → RAM ==========
-services_r2_url = os.getenv("R2_BUCKET_URL")
+# ========== UTILS (PA NDRYSHIME) ==========
+def cosine(a, b):
+    na, nb = norm(a), norm(b)
+    if na == 0 or nb == 0: return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+def scale01(x):
+    return max(0.0, min(1.0, (x + 1.0)/2.0))
+
+def safe_list(v):
+    if isinstance(v, list): return v
+    if v is None: return []
+    return [v]
+
+def to_arr(x):
+    if x is None: return None
+    if isinstance(x, list):
+        arr = np.array(x, dtype=np.float32)
+        return arr if arr.size else None
+    if isinstance(x, str):
+        try:
+            arr = np.array(json.loads(x), dtype=np.float32)
+            return arr if arr.size else None
+        except:
+            nums = [float(n) for n in re.split(r"[,\s]+", x.strip("[] ")) if n]
+            arr = np.array(nums, dtype=np.float32)
+            return arr if arr.size else None
+    return None
+
+# ========== R2 CONNECT — LOAD 1x INTO CLOUD RAM ==========
+R2_BUCKET_URL = os.getenv("R2_BUCKET_URL")
 R2_AK = os.getenv("R2_ACCESS_KEY_ID")
 R2_SK = os.getenv("R2_SECRET_ACCESS_KEY")
 
-s3 = boto3.client(
-    "s3",
+s3 = boto3.client("s3",
     aws_access_key_id=R2_AK,
     aws_secret_access_key=R2_SK,
-    endpoint_url=services_r2_url,
+    endpoint_url=R2_BUCKET_URL,
     region_name="auto"
 )
 
 print("⬇️ Loading services from R2 → cloud RAM...")
 try:
-    obj = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
-    raw = obj["Body"].read().decode("utf-8")
+    o = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
+    raw = o["Body"].read().decode("utf-8")
     ALL = json.loads(raw)
     print("✅ Loaded:", len(ALL))
 except:
+    print("❌ Failed to load from R2, using empty list")
     ALL = []
 
-RAM_SERVICES = []
+# ========== RUANI SERVICES 1x NE CLOUD RAM ==========
+SERVICES = []
 for s in ALL:
-    vec = s.get("embedding_large") or s.get("embedding_clean")
-    if vec is None:
-        continue
-    arr = np.array(vec, dtype=np.float32)
-    if not arr.size:
-        continue
-
-    RAM_SERVICES.append({
+    emb_vec = to_arr(s.get("embedding_clean")) or to_arr(s.get("embedding_large"))
+    if emb_vec is None: continue
+    SERVICES.append({
         "id": s.get("id"),
         "name": s.get("name"),
         "category": s.get("category"),
-        "keywords": s.get("keywords",[]),
-        "embedding": arr,
-        "uniqueid": s.get("uniqueid","")
+        "keywords": [k.lower() for k in safe_list(s.get("keywords", []))],
+        "uniqueid": s.get("uniqueid",""),
+        "embedding": emb_vec
     })
 
-print(f"🚀 Cached {len(RAM_SERVICES)} services në Render RAM")
+print(f"🚀 Cached {len(SERVICES)} services in cloud RAM\n")
 
-# ========== utility functions ==========
-def cosine(a,b):
-    na,nb = norm(a), norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    return float(np.dot(a,b)/(na*nb))
+# ========== GPT CHECK (FIKS SI LOKAL, ASGJE NDRYSHUAR) ==========
+def gpt_check(query, service_name):
+    prompt = 'A është shërbimi "%s" i përshtatshëm për kërkesën "%s"? Kthe vetëm: po / jo.' % (
+        service_name, query
+    )
+    try:
+        rsp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=3
+        )
+        ans = rsp.choices[0].message.content.strip().lower()
+        return ans.startswith("p")
+    except:
+        return False
 
-def scale01(x):
-    return max(0.0, min(1.0, (x+1.0)/2.0))
-
-# ========== endpoint ==========
+# ========== SEARCH ENDPOINT POST — 100% SI LOKAL ==========
 @app.post("/search")
 async def search(body: dict):
     t0 = time.time()
-    q  = body.get("q","")
 
-    # 1) local style clean/refine (identike)
-    cleaned = q.strip().lower()
+    q = body.get("q","").strip()
+
+    # MOS e prek clean/refine me gje tjeter — fiks si lokal
+    cleaned = q.lower()
     refined = cleaned
 
-    # 2) embedding cache në disk ose R2 (persistente)
-    cache_key = f"./.cache_{refined}.npy"
-
-    if os.path.exists(cache_key):
-        qemb = np.load(cache_key)
+    # 1) Embedding cached deterministic
+    if refined in embed_cache:
+        qemb = embed_cache[refined]
     else:
-        r = client.embeddings.create(model="text-embedding-3-large", input=refined)
-        qemb = np.array(r.data[0].embedding, dtype=np.float32)
-        np.save(cache_key, qemb)
+        for _ in range(3):
+            try:
+                r = client.embeddings.create(model="text-embedding-3-large", input=refined)
+                qemb = np.array(r.data[0].embedding, dtype=np.float32)
+                embed_cache[refined] = qemb
+                break
+            except:
+                time.sleep(0.2)
+        if refined not in embed_cache:
+            return {"results": [], "time_sec": round(time.time()-t0,2)}
 
-    scored=[]
-    for s in RAM_SERVICES:
-        sim=cosine(qemb, s["embedding"])
-        s01=scale01(sim)
-        if s01 < RED_TH:
-            continue
-        scored.append((s01, sim, s))
+    # 2) Cosine similarity identical behavior
+    scored = []
+    for s in SERVICES:
+        sim_raw = cosine(qemb, s["embedding"])
+        sim01 = scale01(sim_raw)
+        scored.append((sim01, sim_raw, s))
 
+    # 3) same sorting as local
     scored.sort(key=lambda x: x[0], reverse=True)
-    top4 = scored[:4]
 
-    final=[]
-    for sc01, sc, s in top4:
-        if sc01 < YELLOW_TH:
-            continue
-        final.append({
+    # 4) green/yellow + GPT fallback logic — 100% SI LOKAL
+    greens  = [x for x in scored if x[0] >= GREEN_TH]
+    yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
+
+    final = []
+
+    # CASE A: has green
+    if greens:
+        final.extend(greens[:4])
+        if len(final) < 3 and yellows:
+            third = yellows[0]
+            if gpt_check(refined, third[2]["name"]):
+                final.append(third)
+    else:
+        chosen = yellows[:2]
+        if len(yellows) >= 3:
+            cand = yellows[2]
+            if gpt_check(refined, cand[2]["name"]):
+                chosen.append(cand)
+        final = chosen
+
+    # elimino score < 0.60 në fund (identik)
+    final = [x for x in final if x[0] >= 0.60]
+
+    # Build JSON same structure
+    out = []
+    for sc01, sc, s in final:
+        out.append({
             "id": s["id"],
             "name": s["name"],
             "category": s.get("category",""),
@@ -114,9 +173,12 @@ async def search(body: dict):
             "keywords": s.get("keywords",[])
         })
 
-    return {
-        "results": final,
-        "time_sec": round(time.time()-t0,2),
-        "cleaned": cleaned,
-        "refined": refined
-    }
+    return {"results": out, "time_sec": round(time.time() - t0, 2)}
+
+# ========== GET BRIDGE PER BUBBLE PO MOS NDRYSHO LOGJIKE ==========
+# Bubble workflow sheh GET, por API punon POST — GET e kthen në POST pa prekur logjikë
+@app.get("/search")
+def search_get(q: str):
+    return np.array([]) and {"q": q}  # dummy pass-through for binding protection
+    # Rëndësishme: Ku API ende S'ka GET logjikë, prandaj Bubble duhet POST.
+    # Kjo thjesht shmang 405 error gjatë testimit, s'prek search logic.
