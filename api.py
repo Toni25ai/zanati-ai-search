@@ -2,29 +2,35 @@ import os, time, re, json, boto3
 import numpy as np
 from numpy.linalg import norm
 from fastapi import FastAPI
-from supabase import create_client, Client
 from openai import OpenAI
 
-# ========== FASTAPI APP ==========
+# ========== FASTAPI ==========
 app = FastAPI()
 
-# ========== OPENAI CONNECT ==========
+# ========== OPENAI ==========
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY)
 
-# ========== PARAMETRA (SI LOKAL) ==========
-GREEN_TH = 0.70
+# ========== THRESHOLDS ==========
+GREEN_TH  = 0.70
 YELLOW_TH = 0.60
-RED_TH = 0.60
+RED_TH    = 0.60
 
-# ========== UTILS (PA NDRYSHIME) ==========
+# ========== CACHES ==========
+refine_cache = {}
+embed_cache  = {}
+
+# =========================
+# UTILS
+# =========================
 def cosine(a, b):
     na, nb = norm(a), norm(b)
-    if na == 0 or nb == 0: return 0.0
+    if na == 0 or nb == 0:
+        return 0.0
     return float(np.dot(a, b) / (na * nb))
 
 def scale01(x):
-    return max(0.0, min(1.0, (x + 1.0)/2.0))
+    return max(0.0, min(1.0, (x + 1.0) / 2.0))
 
 def safe_list(v):
     if isinstance(v, list): return v
@@ -32,7 +38,8 @@ def safe_list(v):
     return [v]
 
 def to_arr(x):
-    if x is None: return None
+    if x is None:
+        return None
     if isinstance(x, list):
         arr = np.array(x, dtype=np.float32)
         return arr if arr.size else None
@@ -46,104 +53,143 @@ def to_arr(x):
             return arr if arr.size else None
     return None
 
-# ========== R2 CONNECT — LOAD 1x INTO CLOUD RAM ==========
+# =========================
+# LOAD FROM R2 (fast, 1x)
+# =========================
 R2_BUCKET_URL = os.getenv("R2_BUCKET_URL")
 R2_AK = os.getenv("R2_ACCESS_KEY_ID")
 R2_SK = os.getenv("R2_SECRET_ACCESS_KEY")
 
-s3 = boto3.client("s3",
+s3 = boto3.client(
+    "s3",
     aws_access_key_id=R2_AK,
     aws_secret_access_key=R2_SK,
     endpoint_url=R2_BUCKET_URL,
     region_name="auto"
 )
 
-print("⬇️ Loading services from R2 → cloud RAM...")
+print("⬇️ Loading services from R2 → Render RAM…")
 try:
-    o = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
-    raw = o["Body"].read().decode("utf-8")
+    obj = s3.get_object(
+        Bucket="servicescache",
+        Key="services_cache_v7_clean.json"
+    )
+    raw = obj["Body"].read().decode("utf-8")
     ALL = json.loads(raw)
     print("✅ Loaded:", len(ALL))
-except:
-    print("❌ Failed to load from R2, using empty list")
+except Exception as e:
+    print("❌ Load error:", e)
     ALL = []
 
-# ========== RUANI SERVICES 1x NE CLOUD RAM ==========
+# =========================
+# BUILD SERVICES EXACT LIKE LOCAL
+# =========================
 SERVICES = []
+
 for s in ALL:
-    emb_vec = to_arr(s.get("embedding_clean")) or to_arr(s.get("embedding_large"))
-    if emb_vec is None: continue
+    emb1 = to_arr(s.get("embedding_clean"))
+    emb2 = to_arr(s.get("embedding_large"))
+
+    # -------- FIX I DETYRUESHËM --------
+    # Nuk përdorim OR (e shkaktonte errorin)
+    if isinstance(emb1, np.ndarray):
+        emb = emb1
+    elif isinstance(emb2, np.ndarray):
+        emb = emb2
+    else:
+        continue
+    # -----------------------------------
+
     SERVICES.append({
         "id": s.get("id"),
         "name": s.get("name"),
         "category": s.get("category"),
         "keywords": [k.lower() for k in safe_list(s.get("keywords", []))],
-        "uniqueid": s.get("uniqueid",""),
-        "embedding": emb_vec
+        "uniqueid": s.get("uniqueid", ""),
+        "embedding": emb
     })
 
-print(f"🚀 Cached {len(SERVICES)} services in cloud RAM\n")
+print(f"🚀 Cached {len(SERVICES)} services in RAM")
 
-# ========== GPT CHECK (FIKS SI LOKAL, ASGJE NDRYSHUAR) ==========
+
+# =========================
+# GPT CHECK (identik me lokal)
+# =========================
 def gpt_check(query, service_name):
-    prompt = 'A është shërbimi "%s" i përshtatshëm për kërkesën "%s"? Kthe vetëm: po / jo.' % (
-        service_name, query
-    )
+    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po / jo.'
+
     try:
-        rsp = client.chat.completions.create(
+        r = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=3
         )
-        ans = rsp.choices[0].message.content.strip().lower()
+        ans = r.choices[0].message.content.strip().lower()
         return ans.startswith("p")
     except:
         return False
 
-# ========== SEARCH ENDPOINT POST — 100% SI LOKAL ==========
+
+# =========================
+# EMBEDDING CACHE EXACT LIKE LOCAL
+# =========================
+def embed_query(text: str):
+    key = text.lower()
+
+    if key in embed_cache:
+        return embed_cache[key]
+
+    for _ in range(3):
+        try:
+            r = client.embeddings.create(
+                model="text-embedding-3-large",
+                input=text
+            )
+            arr = np.array(r.data[0].embedding, dtype=np.float32)
+            embed_cache[key] = arr
+            return arr
+        except:
+            time.sleep(0.2)
+
+    return None
+
+
+# ======================================================
+# ===============   SEARCH ENDPOINT   ==================
+# ======================================================
 @app.post("/search")
-async def search(body: dict):
+async def search_service(body: dict):
     t0 = time.time()
 
-    q = body.get("q","").strip()
+    q = body.get("q", "").strip()
 
-    # MOS e prek clean/refine me gje tjeter — fiks si lokal
+    # 1) Clean IDENTIK me lokal
     cleaned = q.lower()
     refined = cleaned
 
-    # 1) Embedding cached deterministic
-    if refined in embed_cache:
-        qemb = embed_cache[refined]
-    else:
-        for _ in range(3):
-            try:
-                r = client.embeddings.create(model="text-embedding-3-large", input=refined)
-                qemb = np.array(r.data[0].embedding, dtype=np.float32)
-                embed_cache[refined] = qemb
-                break
-            except:
-                time.sleep(0.2)
-        if refined not in embed_cache:
-            return {"results": [], "time_sec": round(time.time()-t0,2)}
+    # 2) Embedding IDENTIK
+    qemb = embed_query(refined)
+    if qemb is None:
+        return {"results": [], "time_sec": round(time.time() - t0, 2)}
 
-    # 2) Cosine similarity identical behavior
+    # 3) Similarity EXACT
     scored = []
     for s in SERVICES:
         sim_raw = cosine(qemb, s["embedding"])
         sim01 = scale01(sim_raw)
+        if sim01 < RED_TH: 
+            continue
         scored.append((sim01, sim_raw, s))
 
-    # 3) same sorting as local
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # 4) green/yellow + GPT fallback logic — 100% SI LOKAL
     greens  = [x for x in scored if x[0] >= GREEN_TH]
     yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
 
     final = []
 
-    # CASE A: has green
+    # 100% same logic as PC:
     if greens:
         final.extend(greens[:4])
         if len(final) < 3 and yellows:
@@ -158,27 +204,25 @@ async def search(body: dict):
                 chosen.append(cand)
         final = chosen
 
-    # elimino score < 0.60 në fund (identik)
     final = [x for x in final if x[0] >= 0.60]
 
-    # Build JSON same structure
-    out = []
-    for sc01, sc, s in final:
-        out.append({
-            "id": s["id"],
-            "name": s["name"],
-            "category": s.get("category",""),
-            "score": round(sc01,3),
-            "uniqueid": s.get("uniqueid",""),
-            "keywords": s.get("keywords",[])
-        })
+    results = [{
+        "id": s["id"],
+        "name": s["name"],
+        "category": s.get("category", ""),
+        "score": round(sc01, 3),
+        "uniqueid": s["uniqueid"],
+        "keywords": s.get("keywords", [])
+    } for sc01, sc, s in final[:4]]
 
-    return {"results": out, "time_sec": round(time.time() - t0, 2)}
+    return {
+        "results": results,
+        "time_sec": round(time.time()-t0,2),
+        "cleaned": cleaned,
+        "refined": refined
+    }
 
-# ========== GET BRIDGE PER BUBBLE PO MOS NDRYSHO LOGJIKE ==========
-# Bubble workflow sheh GET, por API punon POST — GET e kthen në POST pa prekur logjikë
-@app.get("/search")
-def search_get(q: str):
-    return np.array([]) and {"q": q}  # dummy pass-through for binding protection
-    # Rëndësishme: Ku API ende S'ka GET logjikë, prandaj Bubble duhet POST.
-    # Kjo thjesht shmang 405 error gjatë testimit, s'prek search logic.
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
