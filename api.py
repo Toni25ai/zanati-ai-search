@@ -307,12 +307,16 @@ def search_service(body: SearchBody):
             "keywords": s.get("keywords", []),
         })
 
-    return {
-        "results": api_results,
-        "time_sec": round(time.time() - t0, 2),
-        "cleaned": cleaned,
-        "refined": refined,
-    }
+# krijo listën e uniqueid sipas renditjes së rezultateve (nga më i larti te më i ulti)
+uniqueid_list = [s["uniqueid"] for (_, _, s) in top4 if s["uniqueid"]]
+
+return {
+    "results": results,
+    "uniqueids": uniqueid_list,   # <<< kjo ruan renditjen e saktë te Bubble
+    "time_sec": round(time.time() - t0, 2),
+    "cleaned": cleaned,
+    "refined": refined
+}
 
 @app.get("/columns")
 def list_columns():
