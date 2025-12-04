@@ -2,46 +2,31 @@ import os, time, re, json, boto3
 import numpy as np
 from numpy.linalg import norm
 from fastapi import FastAPI
-from pydantic import BaseModel
-from openai import OpenAI
 from supabase import create_client, Client
+from openai import OpenAI
 
-# =========================
-# KONFIGURIME
-# =========================
-
-# OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-EMBED_QUERY_MODEL = "text-embedding-3-large"
-ONECALL_MODEL    = "gpt-4o-mini"
-CHECK_MODEL      = "gpt-4o-mini"
-
-GREEN_TH  = 0.70
-YELLOW_TH = 0.60
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# Supabase (vetëm për /columns, s’prek search-in)
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: Client | None = None
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# R2 – ku ke JSON-in me shërbimet
-R2_BUCKET_URL = os.getenv("R2_BUCKET_URL")
-R2_AK = os.getenv("R2_ACCESS_KEY_ID")
-R2_SK = os.getenv("R2_SECRET_ACCESS_KEY")
-R2_BUCKET_NAME = "servicescache"
-R2_KEY = "services_cache_v7_clean.json"
-
-# FastAPI app
+# ========== APP ==========
 app = FastAPI()
 
-# =========================
-# UTILS – IDENTIKE ME LOKAL
-# =========================
+# ========== Supabase ==========
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ========== OpenAI ==========
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_KEY)
+
+# ========== PARAMETRA ==========
+GREEN_TH = 0.70
+YELLOW_TH = 0.60
+RED_TH = 0.60
+
+# ========== CACHES (cloud RAM) ==========
+refine_cache = {}
+embed_cache = {}
+
+# ========== UTILS ==========
 def cosine(a, b):
     na, nb = norm(a), norm(b)
     if na == 0 or nb == 0:
@@ -49,14 +34,7 @@ def cosine(a, b):
     return float(np.dot(a, b) / (na * nb))
 
 def scale01(x):
-    return max(0.0, min(1.0, (x + 1.0) / 2.0))
-
-def safe_list(v):
-    if isinstance(v, list):
-        return v
-    if v is None:
-        return []
-    return [v]
+    return max(0.0, min(1.0, (x + 1.0)/2.0))
 
 def to_arr(x):
     if x is None:
@@ -74,253 +52,165 @@ def to_arr(x):
             return arr if arr.size else None
     return None
 
-# =========================
-# 1) REFINE INTELIGJENT (me CACHE) – IDENTIK
-# =========================
+def safe_list(v):
+    return v if isinstance(v, list) else [] if v is None else [v]
 
-refine_cache: dict[str, tuple[str,str]] = {}
-
-def refine_query(user_input: str):
-    key = user_input.strip().lower()
-    if key in refine_cache:
-        return refine_cache[key]
-
-    prompt = """
-Kthe vetëm JSON:
-{
- "cleaned": "<korrigjim i shkurtër>",
- "refined": "<etiketë 2-6 fjalë: veprim objekt, kategori>"
-}
-
-RREGULLA:
-- Pa pika. Pa fjali të gjata.
-- Nëse kërkesa është profesion: lejo "marangoz, druri", "kurs anglisht, arsim".
-- Nëse ka problem: "riparim bojleri, hidraulik".
-- Të jetë shumë inteligjent me dialekte.
-- MOS përdor fjalë si: dua, duhet, kam nevojë, problemi është, ndihmë.
-
-Shembuj:
-"bojleri nuk ngroh" -> "riparim bojleri, hidraulik"
-"sdi qysh bajne dy plus 2" -> "mësim matematike, arsim"
-"me duhet marangoz" -> "marangoz, druri"
-
-Kërkesa: "%s"
-""" % user_input
-
-    for _ in range(3):
-        try:
-            rsp = client.chat.completions.create(
-                model=ONECALL_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=80,
-            )
-
-            txt = rsp.choices[0].message.content.strip()
-            if txt.startswith("```"):
-                txt = re.sub(r"^```[a-zA-Z]*", "", txt).strip("` \n")
-
-            data = json.loads(txt)
-
-            cleaned = data.get("cleaned", user_input).strip()
-            refined = data.get("refined", cleaned).strip()
-            refined = refined.replace(".", "")
-            refined = re.sub(r"\s+", " ", refined)
-
-            refine_cache[key] = (cleaned, refined)
-            return cleaned, refined
-        except Exception:
-            time.sleep(0.2)
-
-    refine_cache[key] = (user_input, user_input)
-    return user_input, user_input
-
-# =========================
-# 2) EMBEDDING (me CACHE) – IDENTIK
-# =========================
-
-embed_cache: dict[str, np.ndarray] = {}
-
-def embed_query(text: str):
-    key = text.lower()
-    if key in embed_cache:
-        return embed_cache[key]
-    for _ in range(3):
-        try:
-            r = client.embeddings.create(model=EMBED_QUERY_MODEL, input=text)
-            arr = np.array(r.data[0].embedding, dtype=np.float32)
-            embed_cache[key] = arr
-            return arr
-        except Exception:
-            time.sleep(0.3)
-    return None
-
-# =========================
-# 3) GPT CHECK – IDENTIK
-# =========================
-
-def gpt_check(query, service_name):
-    prompt = 'A është shërbimi "%s" i përshtatshëm për kërkesën "%s"? Kthe vetëm: po / jo.' % (
-        service_name, query
-    )
-
+def gpt_check(service_name, query):
+    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Vetëm po/jo.'
     try:
-        rsp = client.chat.completions.create(
-            model=CHECK_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+        r = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
             temperature=0.0,
             max_tokens=3,
+            seed=1234
         )
-        ans = rsp.choices[0].message.content.strip().lower()
+        ans = r.choices[0].message.content.strip().lower()
         return ans.startswith("p")
-    except Exception:
+    except:
         return False
 
-# =========================
-# 4) LOAD SERVICES NGA R2 – E NJEJTA LOGJIKË SI load_services()
-# =========================
+# ========== LOAD SERVICES 1x NGA CLOUDFARE R2 ==========
+R2_BUCKET_URL = os.getenv("R2_BUCKET_URL")
+R2_AK = os.getenv("R2_ACCESS_KEY_ID")
+R2_SK = os.getenv("R2_SECRET_ACCESS_KEY")
 
-def load_services_from_r2():
-    s3 = boto3.client(
-        "s3",
-        aws_access_key_id=R2_AK,
-        aws_secret_access_key=R2_SK,
-        endpoint_url=R2_BUCKET_URL,
-        region_name="auto",
-    )
+s3 = boto3.client("s3",
+    aws_access_key_id=R2_AK,
+    aws_secret_access_key=R2_SK,
+    endpoint_url=R2_BUCKET_URL,
+    region_name="auto"
+)
 
-    print("⬇️ Loading services from R2 → Render RAM…")
-    try:
-        o = s3.get_object(Bucket=R2_BUCKET_NAME, Key=R2_KEY)
-        raw = o["Body"].read().decode("utf-8")
-        data = json.loads(raw)
-        print("✅ Loaded:", len(data))
-    except Exception as e:
-        print("❌ Load error from R2:", e)
-        data = []
+print("⬇️ Loading services from R2 → Render RAM…")
+try:
+    o = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
+    raw = o["Body"].read().decode("utf-8")
+    ALL = json.loads(raw)
+    print("✅ Loaded:", len(ALL))
+except Exception as e:
+    print("❌ Load error:", e)
+    ALL = []
 
-    out = []
-    for s in data:
-        emb_clean = to_arr(s.get("embedding_clean"))
-        if emb_clean is not None:
-            emb = emb_clean
-        else:
-            emb_large = to_arr(s.get("embedding_large"))
-            if emb_large is not None:
-                emb = emb_large
-            else:
-                continue  # skip
+SERVICES = []
+for s in ALL:
+    e1 = to_arr(s.get("embedding_clean"))
+    e2 = to_arr(s.get("embedding_large"))
 
-        out.append({
-            "id": s.get("id"),
-            "name": s.get("name"),
-            "category": s.get("category"),
-            "keywords": [k.lower() for k in safe_list(s.get("keywords", []))],
-            "embedding": emb,
-            "uniqueid": s.get("uniqueid", ""),
-        })
-    print(f"🚀 Cached {len(out)} services in RAM")
-    return out
+    if isinstance(e1, np.ndarray):
+        emb = e1
+    elif isinstance(e2, np.ndarray):
+        emb = e2
+    else:
+        continue
 
-SERVICES = load_services_from_r2()
+    SERVICES.append({
+        "id": s.get("id"),
+        "name": s.get("name"),
+        "category": s.get("category"),
+        "keywords":[k.lower() for k in safe_list(s.get("keywords",[]))],
+        "embedding": emb,
+        "uniqueid": s.get("uniqueid","")
+    })
 
-# =========================
-# 5) SEARCH LOGJIKA – IDENTIKE SMART_SEARCH
-# =========================
+print(f"🚀 Indexed {len(SERVICES)} embeddings në cloud")
 
-def smart_search(user_query, services):
-    times = {}
+# ========== ENDPOINT /search ==========
+
+@app.post("/search")
+async def search_service(body: dict):
     t0 = time.time()
 
-    t = time.time()
-    cleaned, refined = refine_query(user_query)
-    times["refine"] = time.time() - t
+    q = body.get("q", "")
 
-    t = time.time()
-    q_emb = embed_query(refined)
-    times["embed"] = time.time() - t
-    if q_emb is None:
-        return [], times, cleaned, refined
+    key = q.strip().lower()
+    if key in refine_cache:
+        cleaned, refined = refine_cache[key]
+    else:
+        cleaned = re.sub(r"[^a-zA-Z0-9 ëç]+", "", q.lower()).strip()
+        refined = cleaned
+        refine_cache[key] = (cleaned, refined)
 
-    t = time.time()
+    ekey = refined.lower()
+    if ekey in embed_cache:
+        qemb = embed_cache[ekey]
+    else:
+        qemb = None
+        for _ in range(3):
+            try:
+                r = client.embeddings.create(model="text-embedding-3-large", input=refined)
+                qemb = np.array(r.data[0].embedding, dtype=np.float32)
+                embed_cache[ekey] = qemb
+                break
+            except:
+                time.sleep(0.2)
+
+    if qemb is None:
+        return {"results": [], "uniqueids": [], "time_sec": round(time.time()-t0,2)}
+
     scored = []
-    for s in services:
-        sim_raw = cosine(q_emb, s["embedding"])
+    for s in SERVICES:
+        sim_raw = cosine(qemb, s["embedding"])
         sim01 = scale01(sim_raw)
+        if sim01 < RED_TH:
+            continue
         scored.append((sim01, sim_raw, s))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    times["sim"] = time.time() - t
 
-    greens  = [x for x in scored if x[0] >= GREEN_TH]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    top4 = scored[:4]
+
+    greens = [x for x in scored if x[0] >= GREEN_TH]
     yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
 
     final = []
 
-    # CASE A: ka green
     if greens:
-        final.extend(greens[:4])
-
-        if len(final) < 3 and yellows:
-            third = yellows[0]
-            if gpt_check(refined, third[2]["name"]):
-                final.append(third)
-
+        for sc01, sc, s in greens[:4]:
+            final.append((sc01, sc, s))
+        if 1 <= len(final) < 3 and yellows:
+            third = yellows[0][2]
+            if gpt_check(third["name"], refined):
+                final.append((yellows[0][0], yellows[0][1], third))
     else:
-        chosen = yellows[:2]
-        if len(yellows) >= 3:
-            cand = yellows[2]
-            if gpt_check(refined, cand[2]["name"]):
-                chosen.append(cand)
-        final = chosen
+        if yellows:
+            chosen = yellows[:2]
+            if len(yellows) >= 3:
+                cand = yellows[2][2]
+                if gpt_check(cand["name"], refined):
+                    chosen.append(cand)
+            for sc01, sc, s in chosen:
+                final.append((sc01, sc, s))
 
-    # elimino poshtë 0.60 në fund (pa prekur renditjen)
-    final = [x for x in final if x[0] >= 0.60]
+    final = [x for x in final if x[0] >= YELLOW_TH]
 
-    times["total"] = time.time() - t0
-    return final, times, cleaned, refined
-
-# =========================
-# 6) FASTAPI MODELS & ENDPOINTS
-# =========================
-
-class SearchBody(BaseModel):
-    q: str
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.post("/search")
-def search_service(body: SearchBody):
-    t0 = time.time()
-    q = body.q or ""
-    results, times, cleaned, refined = smart_search(q, SERVICES)
-
-    api_results = []
-    for sim01, sim_raw, s in results:
-        api_results.append({
-            "id": s.get("id"),
-            "name": s.get("name"),
-            "category": s.get("category"),
-            "score": round(float(sim01), 3),
-            "uniqueid": s.get("uniqueid", ""),
-            "keywords": s.get("keywords", []),
+    results = []
+    for sc01, sc, s in top4:
+        if sc01 < YELLOW_TH:
+            continue
+        results.append({
+            "id": s["id"],
+            "name": s["name"],
+            "category": s.get("category", ""),
+            "score": round(sc01, 3),
+            "uniqueid": s["uniqueid"],
+            "keywords": s.get("keywords", [])
         })
 
-# krijo listën e uniqueid sipas renditjes së rezultateve (nga më i larti te më i ulti)
-uniqueid_list = [s["uniqueid"] for (_, _, s) in top4 if s["uniqueid"]]
+    # ======================
+    #  *** SHTESA JOTE KËTU ***
+    # ======================
+    uniqueid_list = [s["uniqueid"] for (_, _, s) in top4 if s["uniqueid"]]
 
-return {
-    "results": results,
-    "uniqueids": uniqueid_list,   # <<< kjo ruan renditjen e saktë te Bubble
-    "time_sec": round(time.time() - t0, 2),
-    "cleaned": cleaned,
-    "refined": refined
-}
+    return {
+        "results": results,
+        "uniqueids": uniqueid_list,   # ← renditje e saktë për Bubble
+        "time_sec": round(time.time() - t0, 2),
+        "cleaned": cleaned,
+        "refined": refined
+    }
 
 @app.get("/columns")
 def list_columns():
-    if supabase is None:
-        return []
     s = supabase.table("detailedtable").select("*").limit(1).execute().data
     return [] if not s else list(s[0].keys())
