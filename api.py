@@ -1,32 +1,27 @@
-import os, time, re, json, boto3
+import os, json, time, re
 import numpy as np
 from numpy.linalg import norm
-from fastapi import FastAPI
-from supabase import create_client, Client
+from fastapi import FastAPI, UploadFile, File
 from openai import OpenAI
 
-# ========== APP ==========
-app = FastAPI()
-
-# ========== Supabase ==========
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# ========== OpenAI ==========
+# =========================
+# KONFIGURIME
+# =========================
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY)
 
-# ========== PARAMETRA ==========
-GREEN_TH = 0.70
+GREEN_TH  = 0.70
 YELLOW_TH = 0.60
-RED_TH = 0.60
 
-# ========== CACHES ==========
-refine_cache = {}
-embed_cache = {}
+# =========================
+# FASTAPI
+# =========================
+app = FastAPI()
 
-# ========== UTILS ==========
+# =========================
+# UTILS IDENTIK SI LOKAL
+# =========================
+
 def cosine(a, b):
     na, nb = norm(a), norm(b)
     if na == 0 or nb == 0:
@@ -35,6 +30,11 @@ def cosine(a, b):
 
 def scale01(x):
     return max(0.0, min(1.0, (x + 1.0)/2.0))
+
+def safe_list(v):
+    if isinstance(v, list): return v
+    if v is None: return []
+    return [v]
 
 def to_arr(x):
     if x is None:
@@ -52,54 +52,32 @@ def to_arr(x):
             return arr if arr.size else None
     return None
 
-def safe_list(v):
-    return v if isinstance(v,list) else [] if v is None else [v]
+# =========================
+# GPT REFINE — IDENTIK ME LOKAL
+# =========================
 
-# ========== GPT CHECK ==========
-def gpt_check(query, service_name):
-    prompt = 'A është shërbimi "%s" i përshtatshëm për kërkesën "%s"? Kthe vetëm: po / jo.' % (
-        service_name, query
-    )
+refine_cache = {}
 
-    try:
-        rsp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=3
-        )
-        ans = rsp.choices[0].message.content.strip().lower()
-        return ans.startswith("p")
-    except:
-        return False
-
-# ========== REFINE (IDENTIK ME PC v62 INTEL OPT) ==========
 def refine_query(user_input: str):
     key = user_input.strip().lower()
     if key in refine_cache:
         return refine_cache[key]
 
-    prompt = """
+    prompt = f"""
 Kthe vetëm JSON:
-{
+{{
  "cleaned": "<korrigjim i shkurtër>",
- "refined": "<etiketë 2-6 fjalë: veprim objekt, kategori>"
-}
+ "refined": "<etiketë 2-6 fjalë>"
+}}
 
 RREGULLA:
 - Pa pika. Pa fjali të gjata.
-- Nëse kërkesa është profesion: lejo "marangoz, druri", "kurs anglisht, arsim".
-- Nëse ka problem: "riparim bojleri, hidraulik".
-- Të jetë shumë inteligjent me dialekte.
-- MOS përdor fjalë si: dua, duhet, kam nevojë, problemi është, ndihmë.
+- Pa "dua", "me duhet", "kam nevojë".
+- Përdor etiketa të qarta: "riparim telefoni", "kurs italisht".
+- Super inteligjent me gabime dhe dialekte.
 
-Shembuj:
-"bojleri nuk ngroh" -> "riparim bojleri, hidraulik"
-"sdi qysh bajne dy plus 2" -> "mësim matematike, arsim"
-"me duhet marangoz" -> "marangoz, druri"
-
-Kërkesa: "%s"
-""" % user_input
+Kërkesa: "{user_input}"
+"""
 
     for _ in range(3):
         try:
@@ -129,89 +107,137 @@ Kërkesa: "%s"
     refine_cache[key] = (user_input, user_input)
     return user_input, user_input
 
-# ========== LOAD SERVICES NGA R2 ==========
-R2_BUCKET_URL = os.getenv("R2_BUCKET_URL")
-R2_AK = os.getenv("R2_ACCESS_KEY_ID")
-R2_SK = os.getenv("R2_SECRET_ACCESS_KEY")
+# =========================
+# EMBEDDING CACHE
+# =========================
 
-s3 = boto3.client("s3",
-    aws_access_key_id=R2_AK,
-    aws_secret_access_key=R2_SK,
-    endpoint_url=R2_BUCKET_URL,
-    region_name="auto"
-)
+embed_cache = {}
 
-print("⬇️ Loading services from R2 → Render RAM…")
-try:
-    obj = s3.get_object(Bucket="servicescache", Key="services_cache_v7_clean.json")
-    raw = obj["Body"].read().decode("utf-8")
-    ALL = json.loads(raw)
-    print("✅ Loaded:", len(ALL))
-except Exception as e:
-    print("❌ Load error:", e)
-    ALL = []
+def embed_query(text: str):
+    key = text.lower()
+    if key in embed_cache:
+        return embed_cache[key]
+
+    for _ in range(3):
+        try:
+            r = client.embeddings.create(
+                model="text-embedding-3-large",
+                input=text
+            )
+            arr = np.array(r.data[0].embedding, dtype=np.float32)
+            embed_cache[key] = arr
+            return arr
+        except:
+            time.sleep(0.3)
+
+    return None
+
+# =========================
+# GPT CHECK — IDENTIK (po/jo)
+# =========================
+
+def gpt_check(query, service_name):
+    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po / jo.'
+    try:
+        rsp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=3
+        )
+        ans = rsp.choices[0].message.content.strip().lower()
+        return ans.startswith("p")
+    except:
+        return False
+
+# =========================
+# NGARKO SERVICES NGA DISKU /data
+# =========================
 
 SERVICES = []
-for s in ALL:
-    e1 = to_arr(s.get("embedding_clean"))
-    e2 = to_arr(s.get("embedding_large"))
 
-    if isinstance(e1, np.ndarray):
-        emb = e1
-    elif isinstance(e2, np.ndarray):
-        emb = e2
-    else:
-        continue
+def load_services_from_disk():
+    global SERVICES
+    path = "/data/services_cache.json"
+    if not os.path.exists(path):
+        print("⚠️  /data/services_cache.json NOT FOUND")
+        SERVICES = []
+        return
 
-    SERVICES.append({
-        "id": s.get("id"),
-        "name": s.get("name"),
-        "category": s.get("category"),
-        "keywords":[k.lower() for k in safe_list(s.get("keywords",[]))],
-        "embedding": emb,
-        "uniqueid": s.get("uniqueid","")
-    })
+    try:
+        data = json.load(open(path, "r", encoding="utf-8"))
+    except:
+        print("❌ JSON CORRUPT")
+        SERVICES = []
+        return
 
-print(f"🚀 Cached {len(SERVICES)} services in RAM")
+    out = []
+    for s in data:
+        emb_clean = to_arr(s.get("embedding_clean"))
+        emb_large = to_arr(s.get("embedding_large"))
 
-# ========== ENDPOINT SEARCH (IDENTIK ME PC) ==========
+        if isinstance(emb_clean, np.ndarray):
+            emb = emb_clean
+        elif isinstance(emb_large, np.ndarray):
+            emb = emb_large
+        else:
+            continue
+
+        out.append({
+            "id": s.get("id"),
+            "name": s.get("name"),
+            "category": s.get("category"),
+            "keywords": [k.lower() for k in safe_list(s.get("keywords", []))],
+            "embedding": emb,
+            "uniqueid": s.get("uniqueid","")
+        })
+
+    SERVICES = out
+    print(f"✅ Loaded {len(SERVICES)} services from disk")
+
+load_services_from_disk()
+
+# =========================
+# ENDPOINT → /upload_services
+# =========================
+
+@app.post("/upload_services")
+async def upload_services(file: UploadFile = File(...)):
+    raw = await file.read()
+
+    path = "/data/services_cache.json"
+    with open(path, "wb") as f:
+        f.write(raw)
+
+    # reload in RAM
+    load_services_from_disk()
+
+    return {"status": "ok", "count": len(SERVICES)}
+
+# =========================
+# ENDPOINT → /search (identik me v62)
+# =========================
+
 @app.post("/search")
 async def search_service(body: dict):
     t0 = time.time()
     q = body.get("q", "")
 
-    # REFINE — identik me lokal
     cleaned, refined = refine_query(q)
+    q_emb = embed_query(refined)
 
-    # EMBED
-    ekey = refined.lower()
-    if ekey in embed_cache:
-        qemb = embed_cache[ekey]
-    else:
-        qemb = None
-        for _ in range(3):
-            try:
-                r = client.embeddings.create(model="text-embedding-3-large", input=refined)
-                qemb = np.array(r.data[0].embedding, dtype=np.float32)
-                embed_cache[ekey] = qemb
-                break
-            except:
-                time.sleep(0.2)
+    if q_emb is None:
+        return {"results": [], "uniqueids": []}
 
-    if qemb is None:
-        return {"results": [], "uniqueids": [], "time_sec": round(time.time()-t0,2)}
-
-    # SIMILARITY
     scored = []
     for s in SERVICES:
-        sim_raw = cosine(qemb, s["embedding"])
+        sim_raw = cosine(q_emb, s["embedding"])
         sim01 = scale01(sim_raw)
         scored.append((sim01, sim_raw, s))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    # GREEN/YELLOW RULE (identik)
-    greens = [x for x in scored if x[0] >= GREEN_TH]
+    greens  = [x for x in scored if x[0] >= GREEN_TH]
     yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
 
     final = []
@@ -230,38 +256,29 @@ async def search_service(body: dict):
                 chosen.append(cand)
         final = chosen
 
-    final = [x for x in final if x[0] >= YELLOW_TH]
-
-    # BUILD RESULTS (identik me PC)
-    results = []
+    final = [x for x in final if x[0] >= 0.60]
     top4 = scored[:4]
 
+    results = []
+    uniqueids = []
+
     for sc01, sc, s in top4:
-        if sc01 < YELLOW_TH: 
+        if sc01 < 0.60:
             continue
         results.append({
             "id": s["id"],
             "name": s["name"],
-            "category": s.get("category",""),
+            "category": s["category"],
             "score": round(sc01, 3),
             "uniqueid": s["uniqueid"],
-            "keywords": s.get("keywords",[])
+            "keywords": s["keywords"]
         })
-
-    # LISTA E UNIQUEID sipas renditjes
-    uniqueids = [s["uniqueid"] for (_, _, s) in top4 if s["uniqueid"]]
+        uniqueids.append(s["uniqueid"])
 
     return {
         "results": results,
         "uniqueids": uniqueids,
-        "time_sec": round(time.time() - t0, 2),
         "cleaned": cleaned,
-        "refined": refined
+        "refined": refined,
+        "time_sec": round(time.time() - t0, 2)
     }
-
-
-@app.get("/columns")
-def list_columns():
-    s = supabase.table("detailedtable").select("*").limit(1).execute().data
-    return [] if not s else list(s[0].keys())
-
