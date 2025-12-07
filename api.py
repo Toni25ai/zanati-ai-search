@@ -5,6 +5,11 @@ from fastapi import FastAPI, UploadFile, File
 from openai import OpenAI
 
 # =========================
+# FIX: KRIJO FOLDERIN /data
+# =========================
+os.makedirs("/data", exist_ok=True)
+
+# =========================
 # KONFIGURIME
 # =========================
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
