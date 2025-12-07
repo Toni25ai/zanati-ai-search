@@ -5,11 +5,6 @@ from fastapi import FastAPI, UploadFile, File
 from openai import OpenAI
 
 # =========================
-# FIX: KRIJO FOLDERIN /data
-# =========================
-os.makedirs("/data", exist_ok=True)
-
-# =========================
 # KONFIGURIME
 # =========================
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -17,6 +12,13 @@ client = OpenAI(api_key=OPENAI_KEY)
 
 GREEN_TH  = 0.70
 YELLOW_TH = 0.60
+
+# =========================
+# FOLDER-i i Render për file të ruajtshëm
+# =========================
+DATA_FOLDER = "/opt/render/project/data"
+os.makedirs(DATA_FOLDER, exist_ok=True)
+DATA_PATH = f"{DATA_FOLDER}/services_cache.json"
 
 # =========================
 # FASTAPI
@@ -58,7 +60,7 @@ def to_arr(x):
     return None
 
 # =========================
-# GPT REFINE — IDENTIK ME LOKAL
+# GPT REFINE IDENTIK ME V62 LOKAL
 # =========================
 
 refine_cache = {}
@@ -138,7 +140,7 @@ def embed_query(text: str):
     return None
 
 # =========================
-# GPT CHECK — IDENTIK (po/jo)
+# GPT CHECK — IDENTIK
 # =========================
 
 def gpt_check(query, service_name):
@@ -156,21 +158,21 @@ def gpt_check(query, service_name):
         return False
 
 # =========================
-# NGARKO SERVICES NGA DISKU /data
+# NGARKO SERVICES NGA DISKU
 # =========================
 
 SERVICES = []
 
 def load_services_from_disk():
     global SERVICES
-    path = "/data/services_cache.json"
-    if not os.path.exists(path):
-        print("⚠️  /data/services_cache.json NOT FOUND")
+
+    if not os.path.exists(DATA_PATH):
+        print(f"⚠️  NOT FOUND: {DATA_PATH}")
         SERVICES = []
         return
 
     try:
-        data = json.load(open(path, "r", encoding="utf-8"))
+        data = json.load(open(DATA_PATH, "r", encoding="utf-8"))
     except:
         print("❌ JSON CORRUPT")
         SERVICES = []
@@ -210,17 +212,15 @@ load_services_from_disk()
 async def upload_services(file: UploadFile = File(...)):
     raw = await file.read()
 
-    path = "/data/services_cache.json"
-    with open(path, "wb") as f:
+    with open(DATA_PATH, "wb") as f:
         f.write(raw)
 
-    # reload in RAM
     load_services_from_disk()
 
     return {"status": "ok", "count": len(SERVICES)}
 
 # =========================
-# ENDPOINT → /search (identik me v62)
+# ENDPOINT → /search (IDENTIK ME LOCAL V62)
 # =========================
 
 @app.post("/search")
