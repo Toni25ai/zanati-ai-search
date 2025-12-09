@@ -205,7 +205,7 @@ def load_services_from_disk():
 load_services_from_disk()
 
 # =========================
-# ENDPOINT → /upload_services
+# /upload_services
 # =========================
 
 @app.post("/upload_services")
@@ -220,7 +220,7 @@ async def upload_services(file: UploadFile = File(...)):
     return {"status": "ok", "count": len(SERVICES)}
 
 # =========================
-# ENDPOINT → /search (IDENTIK ME LOCAL V62)
+# /search — IDENTIK, me FIX-in e renditjes
 # =========================
 
 @app.post("/search")
@@ -234,6 +234,9 @@ async def search_service(body: dict):
     if q_emb is None:
         return {"results": [], "uniqueids": []}
 
+    #
+    # 1) Llogarit scorët identik si lokal
+    #
     scored = []
     for s in SERVICES:
         sim_raw = cosine(q_emb, s["embedding"])
@@ -262,6 +265,10 @@ async def search_service(body: dict):
         final = chosen
 
     final = [x for x in final if x[0] >= 0.60]
+
+    #
+    # 2) FIX: Rezultatet dhe uniqueids vijnë sipas renditjes *top4 = scored[:4]*
+    #
     top4 = scored[:4]
 
     results = []
