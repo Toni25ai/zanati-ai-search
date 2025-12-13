@@ -5,22 +5,26 @@ from fastapi import FastAPI, UploadFile, File
 from openai import OpenAI
 
 # =========================
-# CONFIG
+# KONFIGURIME (IDENTIKE)
 # =========================
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_KEY)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+SERVICES_CACHE = "/opt/render/project/data/services_cache.json"
+
+EMBED_QUERY_MODEL = "text-embedding-3-large"
+ONECALL_MODEL    = "gpt-4o-mini"
+CHECK_MODEL      = "gpt-4o-mini"
 
 GREEN_TH  = 0.70
 YELLOW_TH = 0.60
 
-BASE_PATH = "/opt/render/project/data"
-os.makedirs(BASE_PATH, exist_ok=True)
-DATA_PATH = f"{BASE_PATH}/services_cache.json"
+os.makedirs("/opt/render/project/data", exist_ok=True)
 
 app = FastAPI()
 
 # =========================
-# UTILS
+# UTILS (IDENTIKE)
 # =========================
 def cosine(a, b):
     na, nb = norm(a), norm(b)
@@ -32,36 +36,33 @@ def scale01(x):
     return max(0.0, min(1.0, (x + 1.0) / 2.0))
 
 def safe_list(v):
-    if isinstance(v, list):
-        return v
-    if v is None:
-        return []
+    if isinstance(v, list): return v
+    if v is None: return []
     return [v]
 
 def to_arr(x):
     if x is None:
         return None
-
     if isinstance(x, list):
         arr = np.array(x, dtype=np.float32)
         return arr if arr.size else None
-
     if isinstance(x, str):
         try:
             arr = np.array(json.loads(x), dtype=np.float32)
             return arr if arr.size else None
         except:
-            return None
-
+            nums = [float(n) for n in re.split(r"[,\s]+", x.strip("[] ")) if n]
+            arr = np.array(nums, dtype=np.float32)
+            return arr if arr.size else None
     return None
 
 # =========================
-# GPT REFINE (IDENTIKE ME LOKAL)
+# 1) REFINE (IDENTIK)
 # =========================
 refine_cache = {}
 
-def refine_query(q: str):
-    key = q.lower().strip()
+def refine_query(user_input: str):
+    key = user_input.strip().lower()
     if key in refine_cache:
         return refine_cache[key]
 
@@ -74,43 +75,44 @@ Kthe vetëm JSON:
 
 RREGULLA:
 - Pa pika. Pa fjali të gjata.
-- MOS përdor: dua, duhet, kam nevojë, ndihmë.
-- Shembull: "bojleri nuk ngroh" -> "riparim bojleri, hidraulik"
-- Inteligjent me dialekte.
+- Nëse kërkesa është profesion: lejo "marangoz, druri".
+- Nëse ka problem: "riparim bojleri, hidraulik".
+- Të jetë inteligjent me dialekte.
+- MOS përdor: dua, duhet, kam nevojë, problemi është.
 
-Kërkesa: "{q}"
+Kërkesa: "{user_input}"
 """
 
     for _ in range(3):
         try:
-            r = client.chat.completions.create(
-                model="gpt-4o-mini",
+            rsp = client.chat.completions.create(
+                model=ONECALL_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=80
             )
 
-            txt = r.choices[0].message.content.strip()
+            txt = rsp.choices[0].message.content.strip()
             if txt.startswith("```"):
                 txt = re.sub(r"^```[a-zA-Z]*", "", txt).strip("` \n")
 
             data = json.loads(txt)
 
-            cleaned = data.get("cleaned", q).strip()
+            cleaned = data.get("cleaned", user_input).strip()
             refined = data.get("refined", cleaned).strip()
             refined = refined.replace(".", "")
             refined = re.sub(r"\s+", " ", refined)
 
             refine_cache[key] = (cleaned, refined)
             return cleaned, refined
-
         except:
             time.sleep(0.2)
 
-    return q, q
+    refine_cache[key] = (user_input, user_input)
+    return user_input, user_input
 
 # =========================
-# EMBEDDING CACHE
+# 2) EMBEDDING (IDENTIK)
 # =========================
 embed_cache = {}
 
@@ -119,118 +121,166 @@ def embed_query(text: str):
     if key in embed_cache:
         return embed_cache[key]
 
-    r = client.embeddings.create(
-        model="text-embedding-3-large",
-        input=text
-    )
+    for _ in range(3):
+        try:
+            r = client.embeddings.create(
+                model=EMBED_QUERY_MODEL,
+                input=text
+            )
+            arr = np.array(r.data[0].embedding, dtype=np.float32)
+            embed_cache[key] = arr
+            return arr
+        except:
+            time.sleep(0.3)
 
-    arr = np.array(r.data[0].embedding, dtype=np.float32)
-    embed_cache[key] = arr
-    return arr
+    return None
 
 # =========================
-# LOAD SERVICES (BUG-FREE)
+# 3) LOAD SERVICES (IDENTIK)
 # =========================
 SERVICES = []
 
 def load_services():
     global SERVICES
 
-    if not os.path.exists(DATA_PATH):
-        print("❌ services_cache.json NUK ekziston")
+    if not os.path.exists(SERVICES_CACHE):
         SERVICES = []
+        print("❌ services_cache.json NUK ekziston")
         return
 
-    data = json.load(open(DATA_PATH, "r", encoding="utf-8"))
+    data = json.load(open(SERVICES_CACHE, "r", encoding="utf-8"))
     out = []
 
     for s in data:
-        emb = to_arr(s.get("embedding_clean"))
-        if emb is None:
-            emb = to_arr(s.get("embedding_large"))
-        if emb is None:
-            continue
+        emb_clean = to_arr(s.get("embedding_clean"))
+        if emb_clean is not None:
+            emb = emb_clean
+        else:
+            emb_large = to_arr(s.get("embedding_large"))
+            if emb_large is not None:
+                emb = emb_large
+            else:
+                continue
 
         out.append({
             "id": s.get("id"),
             "name": s.get("name"),
             "category": s.get("category"),
-            "keywords": [k.lower() for k in safe_list(s.get("keywords"))],
+            "keywords": [k.lower() for k in safe_list(s.get("keywords", []))],
             "embedding": emb,
             "uniqueid": s.get("uniqueid")
         })
 
     SERVICES = out
-    print(f"✅ Loaded {len(SERVICES)} services")
+    print(f"✅ U ngarkuan {len(SERVICES)} shërbime")
 
-# Load on startup
 load_services()
+
+# =========================
+# 4) GPT CHECK (IDENTIK)
+# =========================
+def gpt_check(query, service_name):
+    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po / jo.'
+
+    try:
+        rsp = client.chat.completions.create(
+            model=CHECK_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=3
+        )
+        ans = rsp.choices[0].message.content.strip().lower()
+        return ans.startswith("p")
+    except:
+        return False
+
+# =========================
+# 5) SMART SEARCH (IDENTIK 1:1)
+# =========================
+def smart_search(user_query):
+    times = {}
+    t0 = time.time()
+
+    t = time.time()
+    cleaned, refined = refine_query(user_query)
+    times["refine"] = time.time() - t
+
+    t = time.time()
+    q_emb = embed_query(refined)
+    times["embed"] = time.time() - t
+    if q_emb is None:
+        return [], times, cleaned, refined
+
+    t = time.time()
+    scored = []
+    for s in SERVICES:
+        sim_raw = cosine(q_emb, s["embedding"])
+        sim01 = scale01(sim_raw)
+        scored.append((sim01, sim_raw, s))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    times["sim"] = time.time() - t
+
+    greens  = [x for x in scored if x[0] >= GREEN_TH]
+    yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
+
+    final = []
+
+    if greens:
+        final.extend(greens[:4])
+        if len(final) < 3 and yellows:
+            third = yellows[0]
+            if gpt_check(refined, third[2]["name"]):
+                final.append(third)
+    else:
+        chosen = yellows[:2]
+        if len(yellows) >= 3:
+            cand = yellows[2]
+            if gpt_check(refined, cand[2]["name"]):
+                chosen.append(cand)
+        final = chosen
+
+    final = [x for x in final if x[0] >= 0.60]
+    times["total"] = time.time() - t0
+
+    return final, times, cleaned, refined
 
 # =========================
 # UPLOAD SERVICES
 # =========================
 @app.post("/upload_services")
 async def upload_services(file: UploadFile = File(...)):
-    try:
-        raw = await file.read()
-        with open(DATA_PATH, "wb") as f:
-            f.write(raw)
-
-        load_services()
-        return {
-            "status": "ok",
-            "count": len(SERVICES)
-        }
-
-    except Exception as e:
-        print("UPLOAD ERROR:", str(e))
-        return {
-            "status": "error",
-            "error": str(e)
-        }
+    raw = await file.read()
+    with open(SERVICES_CACHE, "wb") as f:
+        f.write(raw)
+    load_services()
+    return {"status": "ok", "count": len(SERVICES)}
 
 # =========================
 # SEARCH ENDPOINT
 # =========================
 @app.post("/search")
 async def search(body: dict):
-    q = body.get("q", "").strip()
-    if not q:
+    query = body.get("q", "").strip()
+    if not query:
         return {"results": []}
 
-    t0 = time.time()
+    results, times, cleaned, refined = smart_search(query)
 
-    cleaned, refined = refine_query(q)
-    qemb = embed_query(refined)
-
-    scored = []
-    for s in SERVICES:
-        sim_raw = cosine(qemb, s["embedding"])
-        sim01 = scale01(sim_raw)
-        scored.append((sim01, sim_raw, s))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    top = [x for x in scored if x[0] >= YELLOW_TH][:4]
-
-    results = []
-    uniqueids = []
-
-    for sc01, sc_raw, s in top:
-        results.append({
+    out = []
+    for sim01, sim_raw, s in results:
+        out.append({
             "id": s["id"],
             "name": s["name"],
             "category": s["category"],
-            "score": round(sc01, 3),
+            "score": round(sim01, 3),
+            "cosine": round(sim_raw, 3),
             "uniqueid": s["uniqueid"],
             "keywords": s["keywords"]
         })
-        uniqueids.append(s["uniqueid"])
 
     return {
-        "results": results,
-        "uniqueids": uniqueids,
+        "results": out,
         "cleaned": cleaned,
         "refined": refined,
-        "time_sec": round(time.time() - t0, 2)
+        "timings": times
     }
