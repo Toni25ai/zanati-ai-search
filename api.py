@@ -5,17 +5,17 @@ from fastapi import FastAPI, UploadFile, File
 from openai import OpenAI
 
 # =========================
-# KONFIGURIME
+# CONFIG
 # =========================
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY)
 
-GREEN_TH  = 0.70
+GREEN_TH = 0.70
 YELLOW_TH = 0.60
 
-DATA_FOLDER = "/opt/render/project/data"
-os.makedirs(DATA_FOLDER, exist_ok=True)
-DATA_PATH = f"{DATA_FOLDER}/services_cache.json"
+BASE_PATH = "/opt/render/project/data"
+os.makedirs(BASE_PATH, exist_ok=True)
+DATA_PATH = f"{BASE_PATH}/services_cache.json"
 
 app = FastAPI()
 
@@ -32,12 +32,11 @@ def scale01(x):
     return max(0.0, min(1.0, (x + 1.0) / 2.0))
 
 def safe_list(v):
-    if isinstance(v, list): return v
-    if v is None: return []
-    return [v]
+    return v if isinstance(v, list) else [] if v is None else [v]
 
 def to_arr(x):
-    if x is None: return None
+    if x is None:
+        return None
     if isinstance(x, list):
         arr = np.array(x, dtype=np.float32)
         return arr if arr.size else None
@@ -46,59 +45,46 @@ def to_arr(x):
             arr = np.array(json.loads(x), dtype=np.float32)
             return arr if arr.size else None
         except:
-            nums = [float(n) for n in re.split(r"[,\s]+", x.strip("[] ")) if n]
-            arr = np.array(nums, dtype=np.float32)
-            return arr if arr.size else None
+            return None
     return None
 
 # =========================
-# REFINE — IDENTIK 1:1 ME LOKAL
+# GPT REFINE (IDENTIK ME LOKAL)
 # =========================
 refine_cache = {}
 
-def refine_query(user_input: str):
-    key = user_input.strip().lower()
+def refine_query(q):
+    key = q.lower().strip()
     if key in refine_cache:
         return refine_cache[key]
 
     prompt = f"""
 Kthe vetëm JSON:
-{{
- "cleaned": "<korrigjim i shkurtër>",
- "refined": "<etiketë 2-6 fjalë: veprim objekt, kategori>"
-}}
+{{ "cleaned": "...", "refined": "..." }}
 
 RREGULLA:
-- Pa pika. Pa fjali të gjata.
-- Nëse kërkesa është profesion: lejo "marangoz, druri", "kurs anglisht, arsim".
-- Nëse ka problem: "riparim bojleri, hidraulik".
-- Të jetë shumë inteligjent me dialekte.
-- MOS përdor fjalë si: dua, duhet, kam nevojë, problemi është, ndihmë.
+- Pa fjali.
+- Pa fjalë si: dua, duhet.
+- Formë: "riparim bojleri, hidraulik"
+- Inteligjent me dialekte.
 
-Shembuj:
-"bojleri nuk ngroh" -> "riparim bojleri, hidraulik"
-"sdi qysh bajne dy plus 2" -> "mësim matematike, arsim"
-"me duhet marangoz" -> "marangoz, druri"
-
-Kërkesa: "{user_input}"
+Kërkesa: "{q}"
 """
 
     for _ in range(3):
         try:
-            rsp = client.chat.completions.create(
+            r = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
+                temperature=0,
                 max_tokens=80
             )
-
-            txt = rsp.choices[0].message.content.strip()
+            txt = r.choices[0].message.content.strip()
             if txt.startswith("```"):
                 txt = re.sub(r"^```[a-zA-Z]*", "", txt).strip("` \n")
-
             data = json.loads(txt)
 
-            cleaned = data.get("cleaned", user_input).strip()
+            cleaned = data.get("cleaned", q).strip()
             refined = data.get("refined", cleaned).strip()
             refined = refined.replace(".", "")
             refined = re.sub(r"\s+", " ", refined)
@@ -108,57 +94,35 @@ Kërkesa: "{user_input}"
         except:
             time.sleep(0.2)
 
-    refine_cache[key] = (user_input, user_input)
-    return user_input, user_input
+    return q, q
 
 # =========================
-# EMBEDDING (IDENTIK)
+# EMBEDDING CACHE
 # =========================
 embed_cache = {}
 
-def embed_query(text: str):
+def embed_query(text):
     key = text.lower()
     if key in embed_cache:
         return embed_cache[key]
 
-    for _ in range(3):
-        try:
-            r = client.embeddings.create(
-                model="text-embedding-3-large",
-                input=text
-            )
-            arr = np.array(r.data[0].embedding, dtype=np.float32)
-            embed_cache[key] = arr
-            return arr
-        except:
-            time.sleep(0.3)
-
-    return None
+    r = client.embeddings.create(
+        model="text-embedding-3-large",
+        input=text
+    )
+    arr = np.array(r.data[0].embedding, dtype=np.float32)
+    embed_cache[key] = arr
+    return arr
 
 # =========================
-# GPT CHECK (IDENTIK)
-# =========================
-def gpt_check(query, service_name):
-    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po / jo.'
-    try:
-        rsp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=3
-        )
-        return rsp.choices[0].message.content.strip().lower().startswith("p")
-    except:
-        return False
-
-# =========================
-# LOAD SERVICES NGA DISKU
+# LOAD SERVICES
 # =========================
 SERVICES = []
 
 def load_services():
     global SERVICES
     if not os.path.exists(DATA_PATH):
+        print("❌ services_cache.json NUK ekziston")
         SERVICES = []
         return
 
@@ -174,9 +138,9 @@ def load_services():
             "id": s.get("id"),
             "name": s.get("name"),
             "category": s.get("category"),
-            "keywords": [k.lower() for k in safe_list(s.get("keywords", []))],
+            "keywords": [k.lower() for k in safe_list(s.get("keywords"))],
             "embedding": emb,
-            "uniqueid": s.get("uniqueid", "")
+            "uniqueid": s.get("uniqueid")
         })
 
     SERVICES = out
@@ -196,53 +160,30 @@ async def upload_services(file: UploadFile = File(...)):
     return {"status": "ok", "count": len(SERVICES)}
 
 # =========================
-# SEARCH — IDENTIK + FIX RENDITJE
+# SEARCH (FIX RENDITJA)
 # =========================
 @app.post("/search")
-async def search_service(body: dict):
-    t0 = time.time()
+async def search(body: dict):
     q = body.get("q", "").strip()
+    t0 = time.time()
 
     cleaned, refined = refine_query(q)
-    q_emb = embed_query(refined)
-
-    if q_emb is None:
-        return {"results": [], "uniqueids": []}
+    qemb = embed_query(refined)
 
     scored = []
     for s in SERVICES:
-        sim_raw = cosine(q_emb, s["embedding"])
+        sim_raw = cosine(qemb, s["embedding"])
         sim01 = scale01(sim_raw)
         scored.append((sim01, sim_raw, s))
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    greens  = [x for x in scored if x[0] >= GREEN_TH]
-    yellows = [x for x in scored if YELLOW_TH <= x[0] < GREEN_TH]
+    top4 = [x for x in scored if x[0] >= YELLOW_TH][:4]
 
-    final = []
-
-    if greens:
-        final.extend(greens[:4])
-        if len(final) < 3 and yellows:
-            third = yellows[0]
-            if gpt_check(refined, third[2]["name"]):
-                final.append(third)
-    else:
-        chosen = yellows[:2]
-        if len(yellows) >= 3:
-            cand = yellows[2]
-            if gpt_check(refined, cand[2]["name"]):
-                chosen.append(cand)
-        final = chosen
-
-    final = [x for x in final if x[0] >= 0.60]
-
-    # ✅ FIX RENDITJE — përdor FINAL, jo scored[:4]
     results = []
     uniqueids = []
 
-    for sc01, sc_raw, s in final:
+    for sc01, sc_raw, s in top4:
         results.append({
             "id": s["id"],
             "name": s["name"],
