@@ -13,16 +13,10 @@ client = OpenAI(api_key=OPENAI_KEY)
 GREEN_TH  = 0.70
 YELLOW_TH = 0.60
 
-# =========================
-# RENDER DATA PATH
-# =========================
 DATA_FOLDER = "/opt/render/project/data"
 os.makedirs(DATA_FOLDER, exist_ok=True)
 DATA_PATH = f"{DATA_FOLDER}/services_cache.json"
 
-# =========================
-# FASTAPI
-# =========================
 app = FastAPI()
 
 # =========================
@@ -35,7 +29,7 @@ def cosine(a, b):
     return float(np.dot(a, b) / (na * nb))
 
 def scale01(x):
-    return max(0.0, min(1.0, (x + 1.0)/2.0))
+    return max(0.0, min(1.0, (x + 1.0) / 2.0))
 
 def safe_list(v):
     if isinstance(v, list): return v
@@ -58,7 +52,7 @@ def to_arr(x):
     return None
 
 # =========================
-# REFINE (IDENTIK v62)
+# REFINE — IDENTIK 1:1 ME LOKAL
 # =========================
 refine_cache = {}
 
@@ -76,9 +70,15 @@ Kthe vetëm JSON:
 
 RREGULLA:
 - Pa pika. Pa fjali të gjata.
-- Nëse profesion: "marangoz, druri"
-- Nëse problem: "riparim bojleri, hidraulik"
-- MOS përdor: dua, duhet, kam nevojë
+- Nëse kërkesa është profesion: lejo "marangoz, druri", "kurs anglisht, arsim".
+- Nëse ka problem: "riparim bojleri, hidraulik".
+- Të jetë shumë inteligjent me dialekte.
+- MOS përdor fjalë si: dua, duhet, kam nevojë, problemi është, ndihmë.
+
+Shembuj:
+"bojleri nuk ngroh" -> "riparim bojleri, hidraulik"
+"sdi qysh bajne dy plus 2" -> "mësim matematike, arsim"
+"me duhet marangoz" -> "marangoz, druri"
 
 Kërkesa: "{user_input}"
 """
@@ -87,15 +87,17 @@ Kërkesa: "{user_input}"
         try:
             rsp = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role":"user","content":prompt}],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=80
             )
+
             txt = rsp.choices[0].message.content.strip()
             if txt.startswith("```"):
                 txt = re.sub(r"^```[a-zA-Z]*", "", txt).strip("` \n")
 
             data = json.loads(txt)
+
             cleaned = data.get("cleaned", user_input).strip()
             refined = data.get("refined", cleaned).strip()
             refined = refined.replace(".", "")
@@ -106,10 +108,11 @@ Kërkesa: "{user_input}"
         except:
             time.sleep(0.2)
 
+    refine_cache[key] = (user_input, user_input)
     return user_input, user_input
 
 # =========================
-# EMBEDDING (CACHE)
+# EMBEDDING (IDENTIK)
 # =========================
 embed_cache = {}
 
@@ -129,6 +132,7 @@ def embed_query(text: str):
             return arr
         except:
             time.sleep(0.3)
+
     return None
 
 # =========================
@@ -139,16 +143,16 @@ def gpt_check(query, service_name):
     try:
         rsp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=3
         )
-        return rsp.choices[0].message.content.lower().startswith("p")
+        return rsp.choices[0].message.content.strip().lower().startswith("p")
     except:
         return False
 
 # =========================
-# LOAD SERVICES
+# LOAD SERVICES NGA DISKU
 # =========================
 SERVICES = []
 
@@ -158,20 +162,21 @@ def load_services():
         SERVICES = []
         return
 
-    data = json.load(open(DATA_PATH,"r",encoding="utf-8"))
+    data = json.load(open(DATA_PATH, "r", encoding="utf-8"))
     out = []
 
     for s in data:
         emb = to_arr(s.get("embedding_clean")) or to_arr(s.get("embedding_large"))
-        if emb is None: continue
+        if emb is None:
+            continue
 
         out.append({
             "id": s.get("id"),
             "name": s.get("name"),
             "category": s.get("category"),
-            "keywords": [k.lower() for k in safe_list(s.get("keywords",[]))],
+            "keywords": [k.lower() for k in safe_list(s.get("keywords", []))],
             "embedding": emb,
-            "uniqueid": s.get("uniqueid","")
+            "uniqueid": s.get("uniqueid", "")
         })
 
     SERVICES = out
@@ -185,27 +190,28 @@ load_services()
 @app.post("/upload_services")
 async def upload_services(file: UploadFile = File(...)):
     raw = await file.read()
-    with open(DATA_PATH,"wb") as f:
+    with open(DATA_PATH, "wb") as f:
         f.write(raw)
     load_services()
-    return {"status":"ok","count":len(SERVICES)}
+    return {"status": "ok", "count": len(SERVICES)}
 
 # =========================
-# SEARCH (FIXED)
+# SEARCH — IDENTIK + FIX RENDITJE
 # =========================
 @app.post("/search")
-async def search(body: dict):
+async def search_service(body: dict):
     t0 = time.time()
-    q = body.get("q","")
+    q = body.get("q", "").strip()
 
     cleaned, refined = refine_query(q)
-    qemb = embed_query(refined)
-    if qemb is None:
-        return {"results":[],"uniqueids":[]}
+    q_emb = embed_query(refined)
+
+    if q_emb is None:
+        return {"results": [], "uniqueids": []}
 
     scored = []
     for s in SERVICES:
-        sim_raw = cosine(qemb, s["embedding"])
+        sim_raw = cosine(q_emb, s["embedding"])
         sim01 = scale01(sim_raw)
         scored.append((sim01, sim_raw, s))
 
@@ -219,24 +225,29 @@ async def search(body: dict):
     if greens:
         final.extend(greens[:4])
         if len(final) < 3 and yellows:
-            if gpt_check(refined, yellows[0][2]["name"]):
-                final.append(yellows[0])
+            third = yellows[0]
+            if gpt_check(refined, third[2]["name"]):
+                final.append(third)
     else:
-        final = yellows[:2]
-        if len(yellows) >= 3 and gpt_check(refined, yellows[2][2]["name"]):
-            final.append(yellows[2])
+        chosen = yellows[:2]
+        if len(yellows) >= 3:
+            cand = yellows[2]
+            if gpt_check(refined, cand[2]["name"]):
+                chosen.append(cand)
+        final = chosen
 
     final = [x for x in final if x[0] >= 0.60]
 
+    # ✅ FIX RENDITJE — përdor FINAL, jo scored[:4]
     results = []
     uniqueids = []
 
-    for sc01, sc, s in final:
+    for sc01, sc_raw, s in final:
         results.append({
             "id": s["id"],
             "name": s["name"],
             "category": s["category"],
-            "score": round(sc01,3),
+            "score": round(sc01, 3),
             "uniqueid": s["uniqueid"],
             "keywords": s["keywords"]
         })
@@ -247,5 +258,5 @@ async def search(body: dict):
         "uniqueids": uniqueids,
         "cleaned": cleaned,
         "refined": refined,
-        "time_sec": round(time.time()-t0,2)
+        "time_sec": round(time.time() - t0, 2)
     }
