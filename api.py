@@ -10,7 +10,7 @@ from openai import OpenAI
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_KEY)
 
-GREEN_TH = 0.70
+GREEN_TH  = 0.70
 YELLOW_TH = 0.60
 
 BASE_PATH = "/opt/render/project/data"
@@ -20,7 +20,7 @@ DATA_PATH = f"{BASE_PATH}/services_cache.json"
 app = FastAPI()
 
 # =========================
-# UTILS (IDENTIK)
+# UTILS
 # =========================
 def cosine(a, b):
     na, nb = norm(a), norm(b)
@@ -32,40 +32,50 @@ def scale01(x):
     return max(0.0, min(1.0, (x + 1.0) / 2.0))
 
 def safe_list(v):
-    return v if isinstance(v, list) else [] if v is None else [v]
+    if isinstance(v, list):
+        return v
+    if v is None:
+        return []
+    return [v]
 
 def to_arr(x):
     if x is None:
         return None
+
     if isinstance(x, list):
         arr = np.array(x, dtype=np.float32)
         return arr if arr.size else None
+
     if isinstance(x, str):
         try:
             arr = np.array(json.loads(x), dtype=np.float32)
             return arr if arr.size else None
         except:
             return None
+
     return None
 
 # =========================
-# GPT REFINE (IDENTIK ME LOKAL)
+# GPT REFINE (IDENTIKE ME LOKAL)
 # =========================
 refine_cache = {}
 
-def refine_query(q):
+def refine_query(q: str):
     key = q.lower().strip()
     if key in refine_cache:
         return refine_cache[key]
 
     prompt = f"""
 Kthe vetëm JSON:
-{{ "cleaned": "...", "refined": "..." }}
+{{
+ "cleaned": "<korrigjim i shkurtër>",
+ "refined": "<etiketë 2-6 fjalë: veprim objekt, kategori>"
+}}
 
 RREGULLA:
-- Pa fjali.
-- Pa fjalë si: dua, duhet.
-- Formë: "riparim bojleri, hidraulik"
+- Pa pika. Pa fjali të gjata.
+- MOS përdor: dua, duhet, kam nevojë, ndihmë.
+- Shembull: "bojleri nuk ngroh" -> "riparim bojleri, hidraulik"
 - Inteligjent me dialekte.
 
 Kërkesa: "{q}"
@@ -76,12 +86,14 @@ Kërkesa: "{q}"
             r = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0,
+                temperature=0.0,
                 max_tokens=80
             )
+
             txt = r.choices[0].message.content.strip()
             if txt.startswith("```"):
                 txt = re.sub(r"^```[a-zA-Z]*", "", txt).strip("` \n")
+
             data = json.loads(txt)
 
             cleaned = data.get("cleaned", q).strip()
@@ -91,6 +103,7 @@ Kërkesa: "{q}"
 
             refine_cache[key] = (cleaned, refined)
             return cleaned, refined
+
         except:
             time.sleep(0.2)
 
@@ -101,7 +114,7 @@ Kërkesa: "{q}"
 # =========================
 embed_cache = {}
 
-def embed_query(text):
+def embed_query(text: str):
     key = text.lower()
     if key in embed_cache:
         return embed_cache[key]
@@ -110,17 +123,19 @@ def embed_query(text):
         model="text-embedding-3-large",
         input=text
     )
+
     arr = np.array(r.data[0].embedding, dtype=np.float32)
     embed_cache[key] = arr
     return arr
 
 # =========================
-# LOAD SERVICES
+# LOAD SERVICES (BUG-FREE)
 # =========================
 SERVICES = []
 
 def load_services():
     global SERVICES
+
     if not os.path.exists(DATA_PATH):
         print("❌ services_cache.json NUK ekziston")
         SERVICES = []
@@ -130,7 +145,9 @@ def load_services():
     out = []
 
     for s in data:
-        emb = to_arr(s.get("embedding_clean")) or to_arr(s.get("embedding_large"))
+        emb = to_arr(s.get("embedding_clean"))
+        if emb is None:
+            emb = to_arr(s.get("embedding_large"))
         if emb is None:
             continue
 
@@ -146,6 +163,7 @@ def load_services():
     SERVICES = out
     print(f"✅ Loaded {len(SERVICES)} services")
 
+# Load on startup
 load_services()
 
 # =========================
@@ -153,18 +171,33 @@ load_services()
 # =========================
 @app.post("/upload_services")
 async def upload_services(file: UploadFile = File(...)):
-    raw = await file.read()
-    with open(DATA_PATH, "wb") as f:
-        f.write(raw)
-    load_services()
-    return {"status": "ok", "count": len(SERVICES)}
+    try:
+        raw = await file.read()
+        with open(DATA_PATH, "wb") as f:
+            f.write(raw)
+
+        load_services()
+        return {
+            "status": "ok",
+            "count": len(SERVICES)
+        }
+
+    except Exception as e:
+        print("UPLOAD ERROR:", str(e))
+        return {
+            "status": "error",
+            "error": str(e)
+        }
 
 # =========================
-# SEARCH (FIX RENDITJA)
+# SEARCH ENDPOINT
 # =========================
 @app.post("/search")
 async def search(body: dict):
     q = body.get("q", "").strip()
+    if not q:
+        return {"results": []}
+
     t0 = time.time()
 
     cleaned, refined = refine_query(q)
@@ -178,12 +211,12 @@ async def search(body: dict):
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    top4 = [x for x in scored if x[0] >= YELLOW_TH][:4]
+    top = [x for x in scored if x[0] >= YELLOW_TH][:4]
 
     results = []
     uniqueids = []
 
-    for sc01, sc_raw, s in top4:
+    for sc01, sc_raw, s in top:
         results.append({
             "id": s["id"],
             "name": s["name"],
