@@ -14,7 +14,7 @@ GREEN_TH  = 0.70
 YELLOW_TH = 0.60
 
 # =========================
-# FOLDER-i i Render për file të ruajtshëm
+# RENDER DATA PATH
 # =========================
 DATA_FOLDER = "/opt/render/project/data"
 os.makedirs(DATA_FOLDER, exist_ok=True)
@@ -26,9 +26,8 @@ DATA_PATH = f"{DATA_FOLDER}/services_cache.json"
 app = FastAPI()
 
 # =========================
-# UTILS IDENTIK SI LOKAL
+# UTILS (IDENTIK)
 # =========================
-
 def cosine(a, b):
     na, nb = norm(a), norm(b)
     if na == 0 or nb == 0:
@@ -44,8 +43,7 @@ def safe_list(v):
     return [v]
 
 def to_arr(x):
-    if x is None:
-        return None
+    if x is None: return None
     if isinstance(x, list):
         arr = np.array(x, dtype=np.float32)
         return arr if arr.size else None
@@ -60,9 +58,8 @@ def to_arr(x):
     return None
 
 # =========================
-# GPT REFINE IDENTIK ME V62 LOKAL
+# REFINE (IDENTIK v62)
 # =========================
-
 refine_cache = {}
 
 def refine_query(user_input: str):
@@ -74,14 +71,14 @@ def refine_query(user_input: str):
 Kthe vetëm JSON:
 {{
  "cleaned": "<korrigjim i shkurtër>",
- "refined": "<etiketë 2-6 fjalë>"
+ "refined": "<etiketë 2-6 fjalë: veprim objekt, kategori>"
 }}
 
 RREGULLA:
 - Pa pika. Pa fjali të gjata.
-- Pa "dua", "me duhet", "kam nevojë".
-- Përdor etiketa të qarta: "riparim telefoni", "kurs italisht".
-- Super inteligjent me gabime dhe dialekte.
+- Nëse profesion: "marangoz, druri"
+- Nëse problem: "riparim bojleri, hidraulik"
+- MOS përdor: dua, duhet, kam nevojë
 
 Kërkesa: "{user_input}"
 """
@@ -90,17 +87,15 @@ Kërkesa: "{user_input}"
         try:
             rsp = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role":"user","content":prompt}],
                 temperature=0.0,
                 max_tokens=80
             )
-
             txt = rsp.choices[0].message.content.strip()
             if txt.startswith("```"):
                 txt = re.sub(r"^```[a-zA-Z]*", "", txt).strip("` \n")
 
             data = json.loads(txt)
-
             cleaned = data.get("cleaned", user_input).strip()
             refined = data.get("refined", cleaned).strip()
             refined = refined.replace(".", "")
@@ -111,13 +106,11 @@ Kërkesa: "{user_input}"
         except:
             time.sleep(0.2)
 
-    refine_cache[key] = (user_input, user_input)
     return user_input, user_input
 
 # =========================
-# EMBEDDING CACHE
+# EMBEDDING (CACHE)
 # =========================
-
 embed_cache = {}
 
 def embed_query(text: str):
@@ -136,110 +129,83 @@ def embed_query(text: str):
             return arr
         except:
             time.sleep(0.3)
-
     return None
 
 # =========================
-# GPT CHECK — IDENTIK
+# GPT CHECK (IDENTIK)
 # =========================
-
 def gpt_check(query, service_name):
     prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po / jo.'
     try:
         rsp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role":"user","content":prompt}],
             temperature=0.0,
             max_tokens=3
         )
-        ans = rsp.choices[0].message.content.strip().lower()
-        return ans.startswith("p")
+        return rsp.choices[0].message.content.lower().startswith("p")
     except:
         return False
 
 # =========================
-# NGARKO SERVICES NGA DISKU
+# LOAD SERVICES
 # =========================
-
 SERVICES = []
 
-def load_services_from_disk():
+def load_services():
     global SERVICES
-
     if not os.path.exists(DATA_PATH):
-        print(f"⚠️  NOT FOUND: {DATA_PATH}")
         SERVICES = []
         return
 
-    try:
-        data = json.load(open(DATA_PATH, "r", encoding="utf-8"))
-    except:
-        print("❌ JSON CORRUPT")
-        SERVICES = []
-        return
-
+    data = json.load(open(DATA_PATH,"r",encoding="utf-8"))
     out = []
-    for s in data:
-        emb_clean = to_arr(s.get("embedding_clean"))
-        emb_large = to_arr(s.get("embedding_large"))
 
-        if isinstance(emb_clean, np.ndarray):
-            emb = emb_clean
-        elif isinstance(emb_large, np.ndarray):
-            emb = emb_large
-        else:
-            continue
+    for s in data:
+        emb = to_arr(s.get("embedding_clean")) or to_arr(s.get("embedding_large"))
+        if emb is None: continue
 
         out.append({
             "id": s.get("id"),
             "name": s.get("name"),
             "category": s.get("category"),
-            "keywords": [k.lower() for k in safe_list(s.get("keywords", []))],
+            "keywords": [k.lower() for k in safe_list(s.get("keywords",[]))],
             "embedding": emb,
             "uniqueid": s.get("uniqueid","")
         })
 
     SERVICES = out
-    print(f"✅ Loaded {len(SERVICES)} services from disk")
+    print(f"✅ Loaded {len(SERVICES)} services")
 
-load_services_from_disk()
+load_services()
 
 # =========================
-# /upload_services
+# UPLOAD SERVICES
 # =========================
-
 @app.post("/upload_services")
 async def upload_services(file: UploadFile = File(...)):
     raw = await file.read()
-
-    with open(DATA_PATH, "wb") as f:
+    with open(DATA_PATH,"wb") as f:
         f.write(raw)
-
-    load_services_from_disk()
-
-    return {"status": "ok", "count": len(SERVICES)}
+    load_services()
+    return {"status":"ok","count":len(SERVICES)}
 
 # =========================
-# /search — IDENTIK, me FIX-in e renditjes
+# SEARCH (FIXED)
 # =========================
-
 @app.post("/search")
-async def search_service(body: dict):
+async def search(body: dict):
     t0 = time.time()
-    q = body.get("q", "")
+    q = body.get("q","")
 
     cleaned, refined = refine_query(q)
-    q_emb = embed_query(refined)
+    qemb = embed_query(refined)
+    if qemb is None:
+        return {"results":[],"uniqueids":[]}
 
-    if q_emb is None:
-        return {"results": [], "uniqueids": []}
-
-    #
-    # 1) Llogarit scorët identik si lokal
-    #
     scored = []
     for s in SERVICES:
-        sim_raw = cosine(q_emb, s["embedding"])
+        sim_raw = cosine(qemb, s["embedding"])
         sim01 = scale01(sim_raw)
         scored.append((sim01, sim_raw, s))
 
@@ -253,35 +219,24 @@ async def search_service(body: dict):
     if greens:
         final.extend(greens[:4])
         if len(final) < 3 and yellows:
-            third = yellows[0]
-            if gpt_check(refined, third[2]["name"]):
-                final.append(third)
+            if gpt_check(refined, yellows[0][2]["name"]):
+                final.append(yellows[0])
     else:
-        chosen = yellows[:2]
-        if len(yellows) >= 3:
-            cand = yellows[2]
-            if gpt_check(refined, cand[2]["name"]):
-                chosen.append(cand)
-        final = chosen
+        final = yellows[:2]
+        if len(yellows) >= 3 and gpt_check(refined, yellows[2][2]["name"]):
+            final.append(yellows[2])
 
     final = [x for x in final if x[0] >= 0.60]
-
-    #
-    # 2) FIX: Rezultatet dhe uniqueids vijnë sipas renditjes *top4 = scored[:4]*
-    #
-    top4 = scored[:4]
 
     results = []
     uniqueids = []
 
-    for sc01, sc, s in top4:
-        if sc01 < 0.60:
-            continue
+    for sc01, sc, s in final:
         results.append({
             "id": s["id"],
             "name": s["name"],
             "category": s["category"],
-            "score": round(sc01, 3),
+            "score": round(sc01,3),
             "uniqueid": s["uniqueid"],
             "keywords": s["keywords"]
         })
@@ -292,5 +247,5 @@ async def search_service(body: dict):
         "uniqueids": uniqueids,
         "cleaned": cleaned,
         "refined": refined,
-        "time_sec": round(time.time() - t0, 2)
+        "time_sec": round(time.time()-t0,2)
     }
