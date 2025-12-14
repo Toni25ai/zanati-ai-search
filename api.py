@@ -225,7 +225,6 @@ def smart_search(user_query):
         sim01 = scale01(sim_raw)
         scored.append((sim01, sim_raw, s))
 
-    # ⚠️ Rekomandim: stabilizim sort (opsional por i fortë)
     scored.sort(
         key=lambda x: (round(x[0], 6), round(x[1], 6)),
         reverse=True
@@ -258,6 +257,16 @@ def smart_search(user_query):
     return final, times, cleaned, refined
 
 # =========================
+# TEMP STORAGE FOR GET (UI ONLY)
+# =========================
+LAST_RESULTS = {
+    "results": [],
+    "cleaned": "",
+    "refined": "",
+    "timings": {}
+}
+
+# =========================
 # UPLOAD SERVICES
 # =========================
 @app.post("/upload_services")
@@ -269,7 +278,7 @@ async def upload_services(file: UploadFile = File(...)):
     return {"status": "ok", "count": len(SERVICES)}
 
 # =========================
-# SEARCH ENDPOINT
+# SEARCH ENDPOINT (POST)
 # =========================
 @app.post("/search")
 async def search(body: dict):
@@ -291,9 +300,22 @@ async def search(body: dict):
             "keywords": s["keywords"]
         })
 
+    # ruaj për GET
+    LAST_RESULTS["results"] = out
+    LAST_RESULTS["cleaned"] = cleaned
+    LAST_RESULTS["refined"] = refined
+    LAST_RESULTS["timings"] = times
+
     return {
         "results": out,
         "cleaned": cleaned,
         "refined": refined,
         "timings": times
     }
+
+# =========================
+# GET RESULTS (FOR BUBBLE)
+# =========================
+@app.get("/results")
+async def get_results():
+    return LAST_RESULTS
