@@ -5,7 +5,7 @@ from fastapi import FastAPI, UploadFile, File
 from openai import OpenAI
 
 # =========================
-# KONFIGURIME (IDENTIKE)
+# KONFIGURIME
 # =========================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -24,7 +24,7 @@ os.makedirs("/opt/render/project/data", exist_ok=True)
 app = FastAPI()
 
 # =========================
-# UTILS (IDENTIKE)
+# UTILS
 # =========================
 def cosine(a, b):
     na, nb = norm(a), norm(b)
@@ -57,7 +57,7 @@ def to_arr(x):
     return None
 
 # =========================
-# 1) REFINE (IDENTIK)
+# 1) REFINE (IDENTIK ME LOKAL)
 # =========================
 refine_cache = {}
 
@@ -66,22 +66,27 @@ def refine_query(user_input: str):
     if key in refine_cache:
         return refine_cache[key]
 
-    prompt = f"""
+    prompt = """
 Kthe vetëm JSON:
-{{
+{
  "cleaned": "<korrigjim i shkurtër>",
  "refined": "<etiketë 2-6 fjalë: veprim objekt, kategori>"
-}}
+}
 
 RREGULLA:
 - Pa pika. Pa fjali të gjata.
-- Nëse kërkesa është profesion: lejo "marangoz, druri".
+- Nëse kërkesa është profesion: lejo "marangoz, druri", "kurs anglisht, arsim".
 - Nëse ka problem: "riparim bojleri, hidraulik".
-- Të jetë inteligjent me dialekte.
-- MOS përdor: dua, duhet, kam nevojë, problemi është.
+- Të jetë shumë inteligjent me dialekte.
+- MOS përdor fjalë si: dua, duhet, kam nevojë, problemi është, ndihmë.
 
-Kërkesa: "{user_input}"
-"""
+Shembuj:
+"bojleri nuk ngroh" -> "riparim bojleri, hidraulik"
+"sdi qysh bajne dy plus 2" -> "mësim matematike, arsim"
+"me duhet marangoz" -> "marangoz, druri"
+
+Kërkesa: "%s"
+""" % user_input
 
     for _ in range(3):
         try:
@@ -112,7 +117,7 @@ Kërkesa: "{user_input}"
     return user_input, user_input
 
 # =========================
-# 2) EMBEDDING (IDENTIK)
+# 2) EMBEDDING
 # =========================
 embed_cache = {}
 
@@ -136,7 +141,7 @@ def embed_query(text: str):
     return None
 
 # =========================
-# 3) LOAD SERVICES (IDENTIK)
+# 3) LOAD SERVICES
 # =========================
 SERVICES = []
 
@@ -177,10 +182,12 @@ def load_services():
 load_services()
 
 # =========================
-# 4) GPT CHECK (IDENTIK)
+# 4) GPT CHECK
 # =========================
 def gpt_check(query, service_name):
-    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po / jo.'
+    prompt = 'A është shërbimi "%s" i përshtatshëm për kërkesën "%s"? Kthe vetëm: po / jo.' % (
+        service_name, query
+    )
 
     try:
         rsp = client.chat.completions.create(
@@ -195,7 +202,7 @@ def gpt_check(query, service_name):
         return False
 
 # =========================
-# 5) SMART SEARCH (IDENTIK 1:1)
+# 5) SMART SEARCH
 # =========================
 def smart_search(user_query):
     times = {}
@@ -217,7 +224,13 @@ def smart_search(user_query):
         sim_raw = cosine(q_emb, s["embedding"])
         sim01 = scale01(sim_raw)
         scored.append((sim01, sim_raw, s))
-    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # ⚠️ Rekomandim: stabilizim sort (opsional por i fortë)
+    scored.sort(
+        key=lambda x: (round(x[0], 6), round(x[1], 6)),
+        reverse=True
+    )
+
     times["sim"] = time.time() - t
 
     greens  = [x for x in scored if x[0] >= GREEN_TH]
