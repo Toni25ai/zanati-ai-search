@@ -5,7 +5,7 @@ from fastapi import FastAPI, UploadFile, File
 from openai import OpenAI
 
 # =========================
-# KONFIGURIME
+# KONFIGURIME (IDENTIKE)
 # =========================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -24,7 +24,7 @@ os.makedirs("/opt/render/project/data", exist_ok=True)
 app = FastAPI()
 
 # =========================
-# UTILS
+# UTILS (IDENTIKE)
 # =========================
 def cosine(a, b):
     na, nb = norm(a), norm(b)
@@ -57,7 +57,7 @@ def to_arr(x):
     return None
 
 # =========================
-# 1) REFINE (IDENTIK ME LOKAL)
+# 1) REFINE (IDENTIK)
 # =========================
 refine_cache = {}
 
@@ -66,27 +66,22 @@ def refine_query(user_input: str):
     if key in refine_cache:
         return refine_cache[key]
 
-    prompt = """
+    prompt = f"""
 Kthe vetëm JSON:
-{
+{{
  "cleaned": "<korrigjim i shkurtër>",
  "refined": "<etiketë 2-6 fjalë: veprim objekt, kategori>"
-}
+}}
 
 RREGULLA:
 - Pa pika. Pa fjali të gjata.
-- Nëse kërkesa është profesion: lejo "marangoz, druri", "kurs anglisht, arsim".
+- Nëse kërkesa është profesion: lejo "marangoz, druri".
 - Nëse ka problem: "riparim bojleri, hidraulik".
-- Të jetë shumë inteligjent me dialekte.
-- MOS përdor fjalë si: dua, duhet, kam nevojë, problemi është, ndihmë.
+- Të jetë inteligjent me dialekte.
+- MOS përdor: dua, duhet, kam nevojë, problemi është.
 
-Shembuj:
-"bojleri nuk ngroh" -> "riparim bojleri, hidraulik"
-"sdi qysh bajne dy plus 2" -> "mësim matematike, arsim"
-"me duhet marangoz" -> "marangoz, druri"
-
-Kërkesa: "%s"
-""" % user_input
+Kërkesa: "{user_input}"
+"""
 
     for _ in range(3):
         try:
@@ -117,7 +112,7 @@ Kërkesa: "%s"
     return user_input, user_input
 
 # =========================
-# 2) EMBEDDING
+# 2) EMBEDDING (IDENTIK)
 # =========================
 embed_cache = {}
 
@@ -141,7 +136,7 @@ def embed_query(text: str):
     return None
 
 # =========================
-# 3) LOAD SERVICES
+# 3) LOAD SERVICES (IDENTIK)
 # =========================
 SERVICES = []
 
@@ -182,12 +177,10 @@ def load_services():
 load_services()
 
 # =========================
-# 4) GPT CHECK
+# 4) GPT CHECK (IDENTIK)
 # =========================
 def gpt_check(query, service_name):
-    prompt = 'A është shërbimi "%s" i përshtatshëm për kërkesën "%s"? Kthe vetëm: po / jo.' % (
-        service_name, query
-    )
+    prompt = f'A është shërbimi "{service_name}" i përshtatshëm për kërkesën "{query}"? Kthe vetëm: po / jo.'
 
     try:
         rsp = client.chat.completions.create(
@@ -202,7 +195,7 @@ def gpt_check(query, service_name):
         return False
 
 # =========================
-# 5) SMART SEARCH
+# 5) SMART SEARCH (IDENTIK 1:1)
 # =========================
 def smart_search(user_query):
     times = {}
@@ -224,12 +217,7 @@ def smart_search(user_query):
         sim_raw = cosine(q_emb, s["embedding"])
         sim01 = scale01(sim_raw)
         scored.append((sim01, sim_raw, s))
-
-    scored.sort(
-        key=lambda x: (round(x[0], 6), round(x[1], 6)),
-        reverse=True
-    )
-
+    scored.sort(key=lambda x: x[0], reverse=True)
     times["sim"] = time.time() - t
 
     greens  = [x for x in scored if x[0] >= GREEN_TH]
@@ -257,16 +245,6 @@ def smart_search(user_query):
     return final, times, cleaned, refined
 
 # =========================
-# TEMP STORAGE FOR GET (UI ONLY)
-# =========================
-LAST_RESULTS = {
-    "results": [],
-    "cleaned": "",
-    "refined": "",
-    "timings": {}
-}
-
-# =========================
 # UPLOAD SERVICES
 # =========================
 @app.post("/upload_services")
@@ -278,7 +256,7 @@ async def upload_services(file: UploadFile = File(...)):
     return {"status": "ok", "count": len(SERVICES)}
 
 # =========================
-# SEARCH ENDPOINT (POST)
+# SEARCH ENDPOINT
 # =========================
 @app.post("/search")
 async def search(body: dict):
@@ -300,22 +278,9 @@ async def search(body: dict):
             "keywords": s["keywords"]
         })
 
-    # ruaj për GET
-    LAST_RESULTS["results"] = out
-    LAST_RESULTS["cleaned"] = cleaned
-    LAST_RESULTS["refined"] = refined
-    LAST_RESULTS["timings"] = times
-
     return {
         "results": out,
         "cleaned": cleaned,
         "refined": refined,
         "timings": times
     }
-
-# =========================
-# GET RESULTS (FOR BUBBLE)
-# =========================
-@app.get("/results")
-async def get_results():
-    return LAST_RESULTS
