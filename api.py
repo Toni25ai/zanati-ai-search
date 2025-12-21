@@ -24,6 +24,24 @@ os.makedirs("/opt/render/project/data", exist_ok=True)
 app = FastAPI()
 
 # =========================
+# PROFESSION LIST (NEW - minimal)
+# =========================
+# Mbaje të shkurtër. Shto gradualisht sa të duash.
+PROFESSIONS = {
+    "marangoz",
+    "hidraulik",
+    "elektricist",
+    "bojaxhi",
+    "pllakaxhi",
+    "murator",
+    "saldator",
+    "kondicionerist",
+    "gipsxhi",
+    "kopshtar",
+    "pastrues",
+}
+
+# =========================
 # UTILS (IDENTIKE)
 # =========================
 def cosine(a, b):
@@ -57,12 +75,19 @@ def to_arr(x):
     return None
 
 # =========================
-# 1) REFINE (IDENTIK)
+# 1) REFINE (IDENTIK + shembuj) + FAST-PATH profesion
 # =========================
 refine_cache = {}
 
 def refine_query(user_input: str):
     key = user_input.strip().lower()
+
+    # ✅ NEW: Nëse është profesion i saktë (1 fjalë) mos thirr GPT fare
+    # (kjo s'prek asnjë pjesë tjetër të logjikës)
+    if len(key.split()) == 1 and key in PROFESSIONS:
+        refine_cache[key] = (key, key)
+        return key, key
+
     if key in refine_cache:
         return refine_cache[key]
 
@@ -75,10 +100,15 @@ Kthe vetëm JSON:
 
 RREGULLA:
 - Pa pika. Pa fjali të gjata.
-- Nëse kërkesa është profesion: lejo "marangoz, druri".
+- Nëse kërkesa është profesion: lejo "marangoz, druri", "kurs anglisht, arsim".
 - Nëse ka problem: "riparim bojleri, hidraulik".
-- Të jetë inteligjent me dialekte.
-- MOS përdor: dua, duhet, kam nevojë, problemi është.
+- Të jetë shumë inteligjent me dialekte.
+- MOS përdor fjalë si: dua, duhet, kam nevojë, problemi është, ndihmë.
+
+Shembuj:
+"bojleri nuk ngroh" -> "riparim bojleri, hidraulik"
+"sdi qysh bajne dy plus 2" -> "mësim matematike, arsim"
+"me duhet marangoz" -> "marangoz, druri"
 
 Kërkesa: "{user_input}"
 """
@@ -195,7 +225,7 @@ def gpt_check(query, service_name):
         return False
 
 # =========================
-# 5) SMART SEARCH (IDENTIK 1:1)
+# 5) SMART SEARCH (IDENTIK) + conditional skip GPT check kur profesion i saktë
 # =========================
 def smart_search(user_query):
     times = {}
@@ -204,6 +234,9 @@ def smart_search(user_query):
     t = time.time()
     cleaned, refined = refine_query(user_query)
     times["refine"] = time.time() - t
+
+    # ✅ NEW: vetëm për skip GPT check (nuk prek renditje/pragje)
+    is_clean_profession = (len(refined.split()) == 1 and refined in PROFESSIONS)
 
     t = time.time()
     q_emb = embed_query(refined)
@@ -225,23 +258,29 @@ def smart_search(user_query):
 
     final = []
 
+    # CASE A: ka green
     if greens:
         final.extend(greens[:4])
+
         if len(final) < 3 and yellows:
             third = yellows[0]
-            if gpt_check(refined, third[2]["name"]):
+            # ✅ NEW: nëse refined është profesion i saktë → skip GPT check
+            if is_clean_profession or gpt_check(refined, third[2]["name"]):
                 final.append(third)
+
     else:
         chosen = yellows[:2]
         if len(yellows) >= 3:
             cand = yellows[2]
-            if gpt_check(refined, cand[2]["name"]):
+            # ✅ NEW: nëse refined është profesion i saktë → skip GPT check
+            if is_clean_profession or gpt_check(refined, cand[2]["name"]):
                 chosen.append(cand)
         final = chosen
 
+    # elimino poshtë 0.60 në fund (pa prekur renditjen)
     final = [x for x in final if x[0] >= 0.60]
-    times["total"] = time.time() - t0
 
+    times["total"] = time.time() - t0
     return final, times, cleaned, refined
 
 # =========================
